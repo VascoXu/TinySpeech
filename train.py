@@ -6,23 +6,26 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from conv_tasnet import TasNet
-from sdr import calc_sdr_torch
+from model import TasNet
+from metrics import calc_sdr_torch
 from dataset import DynamicMixDataset, FixedMixDataset
-from losses import L1MultiResSTFTLoss
+from losses import L1MultiResSTFTLoss, PITLoss
+
+GRAD_CLIP = 5.0      # max grad L2 norm
+LR_DECAY = 0.95      # exponential per-epoch LR decay
 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, device):
     model.train()
     total = 0.0
-    for noisy, clean in tqdm(loader, desc="train", leave=False):
-        noisy, clean = noisy.to(device), clean.to(device)
-        estimate = model(noisy).squeeze(1)
-        loss = loss_fn(estimate, clean)
+    for noisy, sources in tqdm(loader, desc="train", leave=False):
+        noisy, sources = noisy.to(device), sources.to(device)
+        estimates = model(noisy)  # (B, 2, T)
+        loss = loss_fn(estimates, sources)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
 
         total += loss.item()
@@ -33,16 +36,19 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device):
 def validate(model, loader, loss_fn, device):
     model.eval()
     losses, sisdrs = [], []
-    for noisy, clean in tqdm(loader, desc="val", leave=False):
-        noisy, clean = noisy.to(device), clean.to(device)
-        estimate = model(noisy).squeeze(1)
-        losses.append(loss_fn(estimate, clean).item())
-        sisdrs.append(calc_sdr_torch(estimate, clean).mean().item())
+    for noisy, sources in tqdm(loader, desc="val", leave=False):
+        noisy, sources = noisy.to(device), sources.to(device)
+        estimates = model(noisy)  # (B, 2, T)
+        losses.append(loss_fn(estimates, sources).item())
+        target = sources[:, 0]
+        sdr_0 = calc_sdr_torch(estimates[:, 0], target)
+        sdr_1 = calc_sdr_torch(estimates[:, 1], target)
+        sisdrs.append(torch.maximum(sdr_0, sdr_1).mean().item())
     return sum(losses) / len(losses), sum(sisdrs) / len(sisdrs)
 
 
 def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device)
     print(f"device: {device}")
 
     train_set = DynamicMixDataset(
@@ -50,6 +56,8 @@ def main(args):
         wham_root=args.wham_root,
         sample_rate=args.sample_rate,
         segment_seconds=args.segment_seconds,
+        silence_prepend_prob=args.silence_prepend_prob,
+        silence_max_seconds=args.silence_max_seconds,
     )
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
@@ -57,25 +65,28 @@ def main(args):
         persistent_workers=args.num_workers > 0,
     )
 
-    model = TasNet(num_spk=1, causal=True, sr=args.sample_rate).to(device)
+    model = TasNet(num_spk=2, causal=True, sr=args.sample_rate).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
-    loss_fn = L1MultiResSTFTLoss().to(device)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=LR_DECAY)
+    loss_fn = PITLoss(L1MultiResSTFTLoss(reduction="none")).to(device)
 
     if args.smoke_test:
         rf_ms = model.receptive_field * model.stride / args.sample_rate * 1000
         print(f"params: {sum(p.numel() for p in model.parameters()):,}")
         print(f"TCN receptive field: {model.receptive_field} frames ({rf_ms:.0f} ms past context)")
-        noisy, clean = next(iter(train_loader))
-        print(f"batch shapes  noisy: {tuple(noisy.shape)}  clean: {tuple(clean.shape)}")
-        noisy, clean = noisy.to(device), clean.to(device)
-        estimate = model(noisy).squeeze(1)
-        print(f"estimate shape: {tuple(estimate.shape)}")
-        loss = loss_fn(estimate, clean)
+        noisy, sources = next(iter(train_loader))
+        print(f"batch shapes  noisy: {tuple(noisy.shape)}  sources: {tuple(sources.shape)}")
+        noisy, sources = noisy.to(device), sources.to(device)
+        estimates = model(noisy)
+        print(f"estimates shape: {tuple(estimates.shape)}")
+        loss = loss_fn(estimates, sources)
         loss.backward()
         assert not torch.isnan(loss), "loss is NaN"
-        sisdr = calc_sdr_torch(estimate.detach(), clean).mean().item()
-        print(f"loss: {loss.item():.4f}  si-sdr (untrained): {sisdr:+.2f} dB")
+        target = sources[:, 0]
+        sdr_0 = calc_sdr_torch(estimates[:, 0].detach(), target)
+        sdr_1 = calc_sdr_torch(estimates[:, 1].detach(), target)
+        sisdr = torch.maximum(sdr_0, sdr_1).mean().item()
+        print(f"loss: {loss.item():.4f}  si-sdr (untrained, best stream): {sisdr:+.2f} dB")
         print("smoke test passed.")
         return
 
@@ -87,9 +98,22 @@ def main(args):
     )
 
     args.ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_sisdr = -float("inf")
 
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    best_sisdr = -float("inf")
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_sisdr = ckpt.get("best_sisdr", -float("inf"))
+        print(f"resumed from {args.resume}: starting at epoch {start_epoch}, "
+              f"prev best si-sdr {best_sisdr:+.2f} dB")
+
+    for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
         val_loss, val_sisdr = validate(model, val_loader, loss_fn, device)
         scheduler.step()
@@ -97,10 +121,20 @@ def main(args):
         print(f"epoch {epoch:03d}  train {train_loss:.4f}  "
               f"val {val_loss:.4f}  si-sdr {val_sisdr:+.2f} dB")
 
-        ckpt = {"model": model.state_dict(), "epoch": epoch, "val_sisdr": val_sisdr}
-        torch.save(ckpt, args.ckpt_dir / "last.pt")
-        if val_sisdr > best_sisdr:
+        is_new_best = val_sisdr > best_sisdr
+        if is_new_best:
             best_sisdr = val_sisdr
+
+        ckpt = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "val_sisdr": val_sisdr,
+            "best_sisdr": best_sisdr,
+        }
+        torch.save(ckpt, args.ckpt_dir / "last.pt")
+        if is_new_best:
             torch.save(ckpt, args.ckpt_dir / "best.pt")
 
 
@@ -112,11 +146,21 @@ if __name__ == "__main__":
                    help="Pre-rendered fixed validation set (.pt of (noisy, clean) tensor pairs)")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run one fwd/bwd pass on a single train batch and exit")
+    p.add_argument("--device", type=str, default="cuda:3",
+                   help='torch device (e.g. "cuda:3", "cuda:0", "cpu")')
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints"))
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Resume from a checkpoint (loads model/optimizer/scheduler/best_sisdr; "
+                        "continues from saved epoch+1 up to --epochs)")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--sample-rate", type=int, default=16000)
     p.add_argument("--segment-seconds", type=float, default=4.0)
+    p.add_argument("--silence-prepend-prob", type=float, default=0.0,
+                   help="Probability of prepending leading silence to the target (0=off; "
+                        "use ~0.3 when fine-tuning a baseline to add silence-then-voice robustness)")
+    p.add_argument("--silence-max-seconds", type=float, default=2.0,
+                   help="Max leading-silence duration in seconds (if silence prepend triggers)")
     main(p.parse_args())
