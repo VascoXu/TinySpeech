@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from model import TasNet
 from metrics import calc_sdr_torch
-from dataset import DynamicMixDataset, FixedMixDataset
+from dataset import DynamicSpeechDataset, ProcessedSpeechDataset
 from losses import L1MultiResSTFTLoss, PITLoss
 
 GRAD_CLIP = 5.0      # max grad L2 norm
@@ -51,13 +51,19 @@ def main(args):
     device = torch.device(args.device)
     print(f"device: {device}")
 
-    train_set = DynamicMixDataset(
+    rir_bank = torch.load(args.rir_bank, map_location="cpu") if args.rir_bank else None
+    if rir_bank is not None:
+        print(f"reverb: {tuple(rir_bank.shape)} RIRs loaded from {args.rir_bank}")
+
+    train_set = DynamicSpeechDataset(
         speech_root=args.speech_root,
         wham_root=args.wham_root,
         sample_rate=args.sample_rate,
         segment_seconds=args.segment_seconds,
         silence_prepend_prob=args.silence_prepend_prob,
         silence_max_seconds=args.silence_max_seconds,
+        rir_bank=rir_bank,
+        reverb_prob=args.reverb_prob,
     )
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
@@ -91,7 +97,7 @@ def main(args):
         return
 
     assert args.val_pt is not None, "--val-pt is required for training"
-    val_set = FixedMixDataset(args.val_pt)
+    val_set = ProcessedSpeechDataset(args.val_pt)
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
@@ -163,4 +169,8 @@ if __name__ == "__main__":
                         "use ~0.3 when fine-tuning a baseline to add silence-then-voice robustness)")
     p.add_argument("--silence-max-seconds", type=float, default=2.0,
                    help="Max leading-silence duration in seconds (if silence prepend triggers)")
+    p.add_argument("--rir-bank", type=Path, default=None,
+                   help="Pre-rendered RIR bank .pt (see rir.py). Enables room reverb on target + babble.")
+    p.add_argument("--reverb-prob", type=float, default=1.0,
+                   help="Probability of applying reverb when --rir-bank is set (rest is dry).")
     main(p.parse_args())

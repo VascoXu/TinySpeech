@@ -41,6 +41,10 @@ venv.bak/
 **/wandb/
 **/*.egg-info/
 **/checkpoints/
+**/checkpoints_reverb/
+**/checkpoints_v2/
 **/*.mp4
 **/datasets
 **/clearbuds
+**/real_outputs
+**/data

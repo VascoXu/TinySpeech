@@ -9,7 +9,12 @@ import torch.nn as nn
 
 
 class cLN(nn.Module):
-    """Cumulative layer norm (causal): normalizes by stats from t' <= t only."""
+    """Cumulative layer norm (causal): normalize by stats from t' <= t over all channels.
+
+    eps must stay tiny (~1e-8); internal TCN activations have small variance, so larger eps
+    silently re-scales every layer's normalization and costs several dB of si-sdr. Silence-
+    at-start amplification needs to be handled at the data/inference layer instead.
+    """
 
     def __init__(self, dimension, eps=1e-8):
         super().__init__()
@@ -37,8 +42,7 @@ class cLN(nn.Module):
         cum_mean = cum_mean.unsqueeze(1)          # (B, 1, T)
         cum_std = cum_std.unsqueeze(1)            # (B, 1, T)
 
-        x = (input - cum_mean) / cum_std          # broadcast over channel
-        return x * self.gain + self.bias
+        return (input - cum_mean) / cum_std * self.gain + self.bias
 
 
 class DepthConv1d(nn.Module):
@@ -61,8 +65,8 @@ class DepthConv1d(nn.Module):
         self.nonlinearity1 = nn.PReLU()
         self.nonlinearity2 = nn.PReLU()
         if causal:
-            self.reg1 = cLN(hidden_channel, eps=1e-08)
-            self.reg2 = cLN(hidden_channel, eps=1e-08)
+            self.reg1 = cLN(hidden_channel)
+            self.reg2 = cLN(hidden_channel)
         else:
             self.reg1 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
             self.reg2 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
@@ -89,7 +93,7 @@ class TCN(nn.Module):
                  layer, stack, kernel=3, skip=True, causal=False, dilated=True):
         super().__init__()
         # input: (B, N=input_dim, L)
-        self.LN = cLN(input_dim, eps=1e-8) if causal else nn.GroupNorm(1, input_dim, eps=1e-8)
+        self.LN = cLN(input_dim) if causal else nn.GroupNorm(1, input_dim, eps=1e-8)
         self.BN = nn.Conv1d(input_dim, BN_dim, 1)
 
         self.dilated = dilated

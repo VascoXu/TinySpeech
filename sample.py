@@ -1,4 +1,4 @@
-"""Draw random babble mixtures from DynamicMixDataset, run the model, save (noisy, clean, estimate)."""
+"""Draw random babble mixtures from DynamicSpeechDataset, run the model, save (noisy, clean, estimate)."""
 import argparse
 import random
 from pathlib import Path
@@ -7,7 +7,7 @@ import torch
 from torchcodec.encoders import AudioEncoder
 
 from model import TasNet
-from dataset import DynamicMixDataset, SR
+from dataset import DynamicSpeechDataset, SR
 from metrics import calc_sdr_torch
 
 
@@ -25,7 +25,7 @@ def pick_target_stream(estimates: torch.Tensor, target: torch.Tensor):
 def main(args):
     random.seed(args.seed)
 
-    ds = DynamicMixDataset(
+    ds = DynamicSpeechDataset(
         speech_root=args.speech_root,
         wham_root=args.wham_root,
     )

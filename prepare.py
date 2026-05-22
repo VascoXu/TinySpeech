@@ -1,4 +1,4 @@
-"""Pack a fixed (noisy, sources) tensor file from DynamicMixDataset for reproducible eval."""
+"""Pack a fixed (noisy, sources) tensor file from DynamicSpeechDataset for reproducible eval."""
 import argparse
 import random
 from pathlib import Path
@@ -6,15 +6,17 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from dataset import DynamicMixDataset
+from dataset import DynamicSpeechDataset
 
 
 def main(args):
     random.seed(args.seed)
-    ds = DynamicMixDataset(
+    rir_bank = torch.load(args.rir_bank, map_location="cpu") if args.rir_bank else None
+    ds = DynamicSpeechDataset(
         speech_root=args.speech_root,
         wham_root=args.wham_root,
         segment_seconds=args.segment_seconds,
+        rir_bank=rir_bank,
     )
 
     noisy, sources = [], []
@@ -36,4 +38,6 @@ if __name__ == "__main__":
     p.add_argument("--n-examples", type=int, default=200)
     p.add_argument("--segment-seconds", type=float, default=4.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rir-bank", type=Path, default=None,
+                   help="Pre-rendered RIR bank .pt (see rir.py). Bakes reverb into the val set.")
     main(p.parse_args())
