@@ -78,13 +78,23 @@ python eval.py \
 
 ## Beamformer preview
 
-Renders multi-mic 3D-room scenes (target + co-directional babble + env noise), applies delay-and-sum beamforming, and saves per-component wavs for listening. Used to validate geometry + SIR/SNR conventions for the eventual beamform + post-filter training pipeline (where the post-filter sees beamformed audio, not raw mixtures).
+Renders multi-mic 3D-room scenes (target + co-directional babble + env noise), applies MVDR beamforming (oracle noise covariance, anechoic steering from gaze direction), and saves per-component wavs for listening. Used to validate geometry + SIR/SNR conventions for the eventual beamform + post-filter training pipeline (where the post-filter sees beamformed audio, not raw mixtures).
 
 ```bash
 python beam.py --dataset vctk librispeech --wham-root datasets/wham_noise
 ```
 
 Outputs to `preview_beam/example_NN/` with 6 wavs per example: dry anechoic target (label), mic 0 raw, beamformed mix, plus the beamformed target / babble / env decompositions. Prints per-scene SI-SDR(mic0 vs beam) so you can verify the beamformer is helping.
+
+## Multi-mic RIR bank
+
+Pre-render multi-mic RIRs for the future beamform-aware training pipeline. Each scene = random 3D room + mic-array placement + RIRs from a grid of (angle, distance) source positions to each mic. At training time, a `BeamformedSpeechDataset` will sample a scene, pick target/babble/env positions from the grid, fft-convolve audio with the corresponding RIRs, sum per-mic, then beamform.
+
+```bash
+python beam_bank.py --n-scenes 100 --out-pt datasets/rir_bank_beam.pt
+```
+
+~6 s per scene at default grid (25 angles × 5 distances × 2 mics × 1 s RIRs ≈ 16 MB/scene). Bank format documented in `beam_bank.py`.
 
 ## Demo
 

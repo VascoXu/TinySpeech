@@ -141,7 +141,7 @@ class TasNet(nn.Module):
         self.causal = causal
 
         self.encoder = nn.Conv1d(1, enc_dim, self.win, bias=False, stride=self.stride)
-        self.TCN = TCN(enc_dim, enc_dim * num_spk, feature_dim, feature_dim * 2,
+        self.TCN = TCN(enc_dim, enc_dim * num_spk, feature_dim, feature_dim * 4,
                        layer, stack, kernel, causal=causal)
         self.receptive_field = self.TCN.receptive_field
         self.decoder = nn.ConvTranspose1d(enc_dim, 1, self.win, bias=False, stride=self.stride)

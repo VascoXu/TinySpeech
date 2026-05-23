@@ -1,12 +1,13 @@
 """Render multi-mic beamformed scenes for the post-filter training preview.
 
 3D ShoeBox + linear mic array + target + 1-3 babble talkers + env noise.
-Per-source rendering keeps SIR/SNR controllable. Delay-and-sum at boresight
-(broadside = arithmetic mic average) is the placeholder beamformer; swap MVDR
-into `beamform_delay_and_sum` later without touching the pipeline.
+Per-source rendering keeps SIR/SNR controllable. Beamforming is MVDR in the
+STFT domain with an anechoic-geometry steering vector and an oracle noise
+covariance (from babble + env signals — in deployment this becomes a
+VAD-gated estimate, but the rest of the code stays the same).
 
 Outputs 6 wavs per example so the user can listen to each component pre- and
-post-beamform, plus prints SI-SDR(mic0→anechoic_target) vs SI-SDR(beam→same)
+post-beamform, plus prints SI-SDR(mic0→reverb_target) vs SI-SDR(beam→same)
 so the gap (what beamforming buys *before* the post-filter sees anything) is
 visible.
 """
@@ -29,6 +30,10 @@ from rir import ROOM_DIM_RANGE, WALL_MARGIN
 CEILING_RANGE = (2.5, 3.5)        # 3D ceiling height range (meters)
 Z_MARGIN = 0.3                    # floor/ceiling margin for source placement (meters)
 SOURCE_Z_JITTER = 0.2             # source z ~ mic_height ± this (meters; head-height variation)
+SPEED_OF_SOUND = 343.0            # m/s — used for MVDR steering-vector geometric delays
+MVDR_N_FFT = 1024                 # 64 ms @ 16 kHz; 75% overlap (hop=256)
+MVDR_HOP = 256
+MVDR_DIAG_LOAD = 1e-6             # diagonal-loading ε for noise-cov regularization
 
 TARGET_ANGLE_JITTER = 8.0         # target sits at boresight (90°) ± this
 TARGET_DIST_RANGE = (1.0, 2.0)
@@ -91,10 +96,57 @@ def render_to_mics(audio, src_pos, mic_positions, room_dim, e_abs, max_order):
     return sig[:, :audio.size(0)]
 
 
-def beamform_delay_and_sum(multi_mic):
-    """(M, T) -> (T,). At broadside the geometric inter-mic delay is zero, so D&S is just the mean.
-    Swap point for MVDR later — keep this signature."""
-    return multi_mic.mean(dim=0)
+def compute_mvdr_weights(noise_mic, mic_positions, target_angle_deg,
+                         n_fft=MVDR_N_FFT, hop=MVDR_HOP, diag_load=MVDR_DIAG_LOAD):
+    """MVDR weights per frequency bin from an oracle noise estimate + anechoic steering vector.
+
+    noise_mic       : (M, T) noise-only signal (in preview: babble_mic + env_mic; in production:
+                              VAD-gated noise segments).
+    mic_positions   : (3, M) absolute 3D mic coords.
+    target_angle_deg: azimuth in degrees; 90° = +y axis = boresight.
+    Returns (F, M) complex weights where F = n_fft // 2 + 1.
+    """
+    M = noise_mic.shape[0]
+    window = torch.hann_window(n_fft)
+    N = torch.stft(noise_mic, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=window, return_complex=True, center=True)        # (M, F, L)
+    L_frames = N.shape[-1]
+
+    # Noise covariance Σ_NN(f) = N(f) N(f)^H / L  for each freq bin
+    N_fml = N.permute(1, 0, 2)                                              # (F, M, L)
+    sigma = (N_fml @ N_fml.conj().transpose(-2, -1)) / L_frames             # (F, M, M)
+    eye = torch.eye(M, dtype=sigma.dtype).unsqueeze(0)
+    sigma = sigma + diag_load * eye
+
+    # Steering vector for plane-wave model: d_k(m) = exp(-j 2π f_k τ_m), τ_m = (r_m · ĥ) / c
+    rad = np.deg2rad(target_angle_deg)
+    direction = torch.tensor([np.cos(rad), np.sin(rad), 0.0], dtype=torch.float32)
+    mics = torch.from_numpy(mic_positions).float()
+    rel = mics - mics.mean(dim=1, keepdim=True)                             # (3, M)
+    tau = (direction @ rel) / SPEED_OF_SOUND                                # (M,)
+    freqs = torch.fft.rfftfreq(n_fft, d=1.0 / SR)                           # (F,)
+    phase = -2 * np.pi * freqs.unsqueeze(1) * tau.unsqueeze(0)              # (F, M)
+    d = torch.exp(1j * phase).to(sigma.dtype)                               # (F, M)
+
+    # w_k = Σ⁻¹ d_k / (d_k^H Σ⁻¹ d_k)
+    d_col = d.unsqueeze(-1)                                                 # (F, M, 1)
+    sigma_inv_d = torch.linalg.solve(sigma, d_col)                          # (F, M, 1)
+    denom = (d_col.conj().transpose(-2, -1) @ sigma_inv_d).squeeze(-1).squeeze(-1)  # (F,)
+    return sigma_inv_d.squeeze(-1) / denom.unsqueeze(-1)                    # (F, M)
+
+
+def beamform_mvdr(multi_mic, weights, n_fft=MVDR_N_FFT, hop=MVDR_HOP):
+    """Apply per-bin MVDR weights to a (M, T) multi-mic signal. Returns (T,)."""
+    length = multi_mic.shape[1]
+    window = torch.hann_window(n_fft)
+    X = torch.stft(multi_mic, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=window, return_complex=True, center=True)        # (M, F, L)
+    X_fml = X.permute(1, 0, 2)                                              # (F, M, L)
+    Y = (weights.conj().unsqueeze(-1) * X_fml).sum(dim=1)                   # (F, L)
+    return torch.istft(Y, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                       window=window, center=True, length=length)
+
+
 
 
 def main(args):
@@ -166,11 +218,13 @@ def main(args):
 
         multi_mic = target_mic + babble_mic + env_mic       # (M, T)
 
-        # Beamform — also run per-component through D&S for listening
-        beam        = beamform_delay_and_sum(multi_mic)
-        beam_target = beamform_delay_and_sum(target_mic)
-        beam_babble = beamform_delay_and_sum(babble_mic)
-        beam_env    = beamform_delay_and_sum(env_mic)
+        # MVDR weights are computed once per scene from oracle noise (babble + env), then
+        # applied to multi_mic and each per-source path (linear operator → consistent decomp).
+        mvdr_w = compute_mvdr_weights(babble_mic + env_mic, mic_positions, target_angle)
+        beam        = beamform_mvdr(multi_mic,  mvdr_w)
+        beam_target = beamform_mvdr(target_mic, mvdr_w)
+        beam_babble = beamform_mvdr(babble_mic, mvdr_w)
+        beam_env    = beamform_mvdr(env_mic,    mvdr_w)
 
         # Diagnostics — SI-SDR uses the *reverberant* target as reference (target-only signal at
         # the array), so the metric isolates "did the beamformer suppress interference?" from
