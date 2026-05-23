@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from model import TasNet
 from metrics import calc_sdr_torch
-from dataset import DynamicSpeechDataset, ProcessedSpeechDataset
+from dataset import DATASETS, DynamicSpeechDataset, ProcessedSpeechDataset
 from losses import L1MultiResSTFTLoss, PITLoss
 
 GRAD_CLIP = 5.0      # max grad L2 norm
@@ -55,13 +55,13 @@ def main(args):
     if rir_bank is not None:
         print(f"reverb: {tuple(rir_bank.shape)} RIRs loaded from {args.rir_bank}")
 
+    speech_roots = [DATASETS[d] for d in args.dataset]
+    print(f"dataset: {', '.join(args.dataset)}")
     train_set = DynamicSpeechDataset(
-        speech_root=args.speech_root,
+        speech_root=speech_roots,
         wham_root=args.wham_root,
         sample_rate=args.sample_rate,
         segment_seconds=args.segment_seconds,
-        silence_prepend_prob=args.silence_prepend_prob,
-        silence_max_seconds=args.silence_max_seconds,
         rir_bank=rir_bank,
         reverb_prob=args.reverb_prob,
     )
@@ -72,13 +72,14 @@ def main(args):
     )
 
     model = TasNet(num_spk=2, causal=True, sr=args.sample_rate).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"model: {n_params:,} params ({n_params/1e6:.2f}M)")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=LR_DECAY)
     loss_fn = PITLoss(L1MultiResSTFTLoss(reduction="none")).to(device)
 
     if args.smoke_test:
         rf_ms = model.receptive_field * model.stride / args.sample_rate * 1000
-        print(f"params: {sum(p.numel() for p in model.parameters()):,}")
         print(f"TCN receptive field: {model.receptive_field} frames ({rf_ms:.0f} ms past context)")
         noisy, sources = next(iter(train_loader))
         print(f"batch shapes  noisy: {tuple(noisy.shape)}  sources: {tuple(sources.shape)}")
@@ -146,7 +147,10 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--speech-root", type=Path, required=True)
+    p.add_argument("--dataset", nargs="+", choices=sorted(DATASETS.keys()), required=True,
+                   metavar="NAME",
+                   help=f"Speech dataset(s) to train on (mix for OOD robustness). "
+                        f"Choices: {sorted(DATASETS.keys())}")
     p.add_argument("--wham-root", type=Path, required=True)
     p.add_argument("--val-pt", type=Path, default=None,
                    help="Pre-rendered fixed validation set (.pt of (noisy, clean) tensor pairs)")
@@ -164,11 +168,6 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--sample-rate", type=int, default=16000)
     p.add_argument("--segment-seconds", type=float, default=4.0)
-    p.add_argument("--silence-prepend-prob", type=float, default=0.0,
-                   help="Probability of prepending leading silence to the target (0=off; "
-                        "use ~0.3 when fine-tuning a baseline to add silence-then-voice robustness)")
-    p.add_argument("--silence-max-seconds", type=float, default=2.0,
-                   help="Max leading-silence duration in seconds (if silence prepend triggers)")
     p.add_argument("--rir-bank", type=Path, default=None,
                    help="Pre-rendered RIR bank .pt (see rir.py). Enables room reverb on target + babble.")
     p.add_argument("--reverb-prob", type=float, default=1.0,

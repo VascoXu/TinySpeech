@@ -11,7 +11,7 @@ def calc_sdr_torch(estimation: torch.Tensor, origin: torch.Tensor,
         origin = origin * mask
         estimation = estimation * mask
 
-    origin_power = origin.pow(2).sum(1, keepdim=True) + EPS         # (B, 1)
+    origin_power = origin.pow(2).sum(1, keepdim=True) + EPS            # (B, 1)
     scale = (origin * estimation).sum(1, keepdim=True) / origin_power  # (B, 1)
 
     est_true = scale * origin            # projection onto target

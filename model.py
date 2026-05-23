@@ -9,12 +9,7 @@ import torch.nn as nn
 
 
 class cLN(nn.Module):
-    """Cumulative layer norm (causal): normalize by stats from t' <= t over all channels.
-
-    eps must stay tiny (~1e-8); internal TCN activations have small variance, so larger eps
-    silently re-scales every layer's normalization and costs several dB of si-sdr. Silence-
-    at-start amplification needs to be handled at the data/inference layer instead.
-    """
+    """Cumulative layer norm (causal): normalize by stats from t' <= t over all channels."""
 
     def __init__(self, dimension, eps=1e-8):
         super().__init__()
@@ -146,7 +141,7 @@ class TasNet(nn.Module):
         self.causal = causal
 
         self.encoder = nn.Conv1d(1, enc_dim, self.win, bias=False, stride=self.stride)
-        self.TCN = TCN(enc_dim, enc_dim * num_spk, feature_dim, feature_dim * 4,
+        self.TCN = TCN(enc_dim, enc_dim * num_spk, feature_dim, feature_dim * 2,
                        layer, stack, kernel, causal=causal)
         self.receptive_field = self.TCN.receptive_field
         self.decoder = nn.ConvTranspose1d(enc_dim, 1, self.win, bias=False, stride=self.stride)

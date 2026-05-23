@@ -40,9 +40,7 @@ venv.bak/
 **/lightning_logs/
 **/wandb/
 **/*.egg-info/
-**/checkpoints/
-**/checkpoints_reverb/
-**/checkpoints_v2/
+**/checkpoints**/
 **/*.mp4
 **/datasets
 **/clearbuds

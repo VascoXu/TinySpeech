@@ -4,7 +4,7 @@ Causal Conv-TasNet for single-channel babble denoising at 16 kHz.
 
 ## Setup
 
-Expects [VCTK-0.92](https://datashare.ed.ac.uk/handle/10283/3443) speech and [WHAM!](http://wham.whisper.ai/) noise under `datasets/`.
+Expects [VCTK-0.92](https://datashare.ed.ac.uk/handle/10283/3443) and [LibriSpeech](https://www.openslr.org/12/) (train-clean-360, test-clean) speech and [WHAM!](http://wham.whisper.ai/) noise under `datasets/`.
 
 ## Train
 
@@ -14,13 +14,16 @@ python prepare.py \
   --speech-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed \
   --wham-root datasets/wham_noise
 
-# 2. Train
+
+# 2. Train (multi-corpus: VCTK + LibriSpeech train-clean-360 for OOD robustness)
 python train.py \
-  --speech-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed \
+  --dataset vctk librispeech \
   --wham-root datasets/wham_noise \
   --val-pt datasets/val_vctk.pt \
   --epochs 100
 ```
+
+Dataset name → path mapping lives in `dataset.py:DATASETS`. Add new datasets there.
 
 Resume: add `--resume checkpoints/last.pt`.
 
@@ -41,7 +44,7 @@ python prepare.py \
 
 # 3. Fine-tune from the dry checkpoint
 python train.py \
-  --speech-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed \
+  --dataset vctk librispeech \
   --wham-root datasets/wham_noise \
   --val-pt datasets/val_vctk_reverb.pt \
   --rir-bank datasets/rir_bank.pt \
@@ -49,6 +52,39 @@ python train.py \
   --ckpt-dir checkpoints_reverb \
   --epochs 20
 ```
+
+## OOD test set
+
+For cross-corpus speaker generalization eval — both target and babble are unseen LibriSpeech speakers.
+
+```bash
+python prepare.py \
+  --speech-root datasets/LibriSpeech/test-clean \
+  --wham-root datasets/wham_noise \
+  --out-pt datasets/test_libri.pt \
+  --n-examples 1000 \
+  --seed 1
+```
+
+## Evaluate
+
+Run a checkpoint against a rendered test set. Reports SI-SDR, SI-SDRi, PESQ, STOI.
+
+```bash
+python eval.py \
+  --checkpoint checkpoints/best.pt \
+  --test-pt datasets/test_libri.pt
+```
+
+## Beamformer preview
+
+Renders multi-mic 3D-room scenes (target + co-directional babble + env noise), applies delay-and-sum beamforming, and saves per-component wavs for listening. Used to validate geometry + SIR/SNR conventions for the eventual beamform + post-filter training pipeline (where the post-filter sees beamformed audio, not raw mixtures).
+
+```bash
+python beam.py --dataset vctk librispeech --wham-root datasets/wham_noise
+```
+
+Outputs to `preview_beam/example_NN/` with 6 wavs per example: dry anechoic target (label), mic 0 raw, beamformed mix, plus the beamformed target / babble / env decompositions. Prints per-scene SI-SDR(mic0 vs beam) so you can verify the beamformer is helping.
 
 ## Demo
 

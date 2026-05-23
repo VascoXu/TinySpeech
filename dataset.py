@@ -14,6 +14,13 @@ GAIN_DB_DEFAULT = (-15.0, 5.0)        # final per-sample gain (simulates mic-dis
 BABBLE_N_DEFAULT = (3, 10)            # number of stacked interfering voices
 BABBLE_GAIN_RANGE = (0.5, 1.0)        # per-voice gain inside the babble stack
 
+# Dataset registry — short name -> speech root. Lets train.py take --dataset vctk librispeech
+# instead of typing out full paths every invocation.
+DATASETS = {
+    "vctk":        Path("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed"),
+    "librispeech": Path("datasets/LibriSpeech/train-clean-360"),
+}
+
 
 def load_mono(path: Path, sample_rate: int) -> torch.Tensor:
     samples = AudioDecoder(str(path), sample_rate=sample_rate).get_all_samples()
@@ -37,9 +44,16 @@ def scale_to_snr(target: torch.Tensor, interferer: torch.Tensor, snr_db: float) 
     return interferer * (rms(target) / (rms(interferer) * 10 ** (snr_db / 20)))
 
 
-def list_speech_files(root: Path) -> list:
-    # VCTK 0.92 ships two mic renditions per utterance; keep only mic1 so each utterance is unique.
-    return sorted(p for p in Path(root).rglob("*.flac") if not p.name.endswith("_mic2.flac"))
+def list_speech_files(roots) -> list:
+    # Accepts a single Path or an iterable of Paths (for multi-corpus training).
+    # VCTK 0.92 ships two mic renditions per utterance; keep only mic1 so each utterance is unique
+    # (the filter is a no-op on LibriSpeech and other corpora).
+    if isinstance(roots, (str, Path)):
+        roots = [roots]
+    files = []
+    for r in roots:
+        files.extend(p for p in Path(r).rglob("*.flac") if not p.name.endswith("_mic2.flac"))
+    return sorted(files)
 
 
 class DynamicSpeechDataset(Dataset):
@@ -53,8 +67,6 @@ class DynamicSpeechDataset(Dataset):
                  snr_db_range=SNR_DB_DEFAULT,
                  gain_db_range=GAIN_DB_DEFAULT,
                  babble_n_range=BABBLE_N_DEFAULT,
-                 silence_prepend_prob: float = 0.0,
-                 silence_max_seconds: float = 2.0,
                  rir_bank: torch.Tensor = None,
                  reverb_prob: float = 1.0):
         self.sr = sample_rate
@@ -63,8 +75,6 @@ class DynamicSpeechDataset(Dataset):
         self.snr_range = snr_db_range
         self.gain_range = gain_db_range
         self.babble_n_range = babble_n_range
-        self.silence_prepend_prob = silence_prepend_prob
-        self.silence_max_samples = int(silence_max_seconds * self.sr)
         self.rir_bank = rir_bank
         self.reverb_prob = reverb_prob
 
@@ -77,11 +87,6 @@ class DynamicSpeechDataset(Dataset):
         return self.epoch_size
 
     def __getitem__(self, _):
-        # optional leading silence; keep >=1 s of voice
-        sil = (random.randint(0, min(self.silence_max_samples, self.n_samples - self.sr))
-               if random.random() < self.silence_prepend_prob else 0)
-        n_voice = self.n_samples - sil
-
         # one room per scene — target and babble share the RIR; env stays dry (WHAM is already reverberant)
         rir = (self.rir_bank[random.randrange(len(self.rir_bank))]
                if self.rir_bank is not None and random.random() < self.reverb_prob
@@ -91,9 +96,7 @@ class DynamicSpeechDataset(Dataset):
             x = random_segment(load_mono(random.choice(self.speech_files), self.sr), n)
             return fft_convolve(x, rir, n) if rir is not None else x
 
-        voice = load_voice(n_voice)
-        target = torch.zeros(self.n_samples, dtype=voice.dtype)
-        target[sil:] = voice
+        target = load_voice(self.n_samples)
 
         k = random.randint(*self.babble_n_range)
         babble = torch.zeros_like(target)
@@ -103,9 +106,8 @@ class DynamicSpeechDataset(Dataset):
 
         env = random_segment(load_mono(random.choice(self.noise_files), self.sr), self.n_samples)
 
-        # SNR is measured against the dry voice signal, not the silence-padded target.
         snr_db = random.uniform(*self.snr_range)
-        interference = scale_to_snr(voice, babble, snr_db) + scale_to_snr(voice, env, snr_db)
+        interference = scale_to_snr(target, babble, snr_db) + scale_to_snr(target, env, snr_db)
 
         gain = 10 ** (random.uniform(*self.gain_range) / 20.0)
         target = (target * gain).float()
