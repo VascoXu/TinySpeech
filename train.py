@@ -15,8 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from beam_data import SpatialAudioDataset
-from dataset import DATASETS, ProcessedSpeechDataset
+from dataset import DATASETS, ProcessedSpeechDataset, SpatialAudioDataset
 from losses import MultiResSTFTLoss
 from metrics import calc_sdr_torch
 from model import TasNet

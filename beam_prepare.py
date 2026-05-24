@@ -13,8 +13,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from beam_data import SpatialAudioDataset
-from dataset import DATASETS
+from dataset import DATASETS, SpatialAudioDataset
 
 
 def main(args):
