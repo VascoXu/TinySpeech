@@ -1,176 +1,164 @@
-"""Conv-TasNet for single-channel speech separation.
+"""Causal Conv-TasNet — single-channel post-filter for the MVDR-beamformed front end.
 
-  encoder   : strided 1D conv, waveform -> N-dim "frames"     (B, T) -> (B, N, L)
-  separator : stacked dilated depth-wise TCN blocks emit one mask per source
-  decoder   : overlap-add convT back to time domain           (B, C, N, L) -> (B, C, T)
+Mirrors the ClearBuds reference (clearbuds_waveform/src/conv_tasnet.py) exactly:
+  encoder    : strided 1D-conv with stride=L (no overlap), ReLU.   (B, 1, T) -> (B, N, K)
+  separator  : channelwise LayerNorm + 1×1 bottleneck + stacked dilated TCN blocks
+               + 1×1 mask projection + ReLU mask nonlinearity.     (B, N, K) -> (B, C, N, K)
+  decoder    : per-frame linear basis (N -> L), then concatenate.  (B, N, K), mask -> (B, C, K·L)
+
+The model emits C streams (default C=1: just the target voice). C=2 is supported but rarely
+useful for our beamformed-input setup — see the README and conversation history for rationale.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class cLN(nn.Module):
-    """Cumulative layer norm (causal): normalize by stats from t' <= t over all channels."""
+class ChannelwiseLayerNorm(nn.Module):
+    """Per-frame normalization across channels. Causal by construction (no time mixing)."""
 
-    def __init__(self, dimension, eps=1e-8):
+    def __init__(self, channel_size: int, eps: float = 1e-8):
         super().__init__()
         self.eps = eps
-        self.gain = nn.Parameter(torch.ones(1, dimension, 1))
-        self.bias = nn.Parameter(torch.zeros(1, dimension, 1))
+        self.gamma = nn.Parameter(torch.ones(1, channel_size, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channel_size, 1))
 
-    def forward(self, input):
-        # input: (B, C, T)
-        channel = input.size(1)
-        time_step = input.size(2)
-
-        step_sum = input.sum(1)                   # (B, T)
-        step_pow_sum = input.pow(2).sum(1)        # (B, T)
-        cum_sum = torch.cumsum(step_sum, dim=1)
-        cum_pow_sum = torch.cumsum(step_pow_sum, dim=1)
-
-        entry_cnt = torch.arange(1, time_step + 1, device=input.device, dtype=input.dtype) * channel
-        entry_cnt = entry_cnt.view(1, -1).expand_as(cum_sum)
-
-        cum_mean = cum_sum / entry_cnt
-        cum_var = (cum_pow_sum - 2 * cum_mean * cum_sum) / entry_cnt + cum_mean.pow(2)
-        cum_std = (cum_var + self.eps).sqrt()
-
-        cum_mean = cum_mean.unsqueeze(1)          # (B, 1, T)
-        cum_std = cum_std.unsqueeze(1)            # (B, 1, T)
-
-        return (input - cum_mean) / cum_std * self.gain + self.bias
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        # y: (B, C, K)
+        mean = y.mean(dim=1, keepdim=True)
+        var = ((y - mean) ** 2).mean(dim=1, keepdim=True)
+        return self.gamma * (y - mean) / (var + self.eps).sqrt() + self.beta
 
 
-class DepthConv1d(nn.Module):
-    """One TCN residual block: 1x1 conv -> depth-wise dilated conv -> 1x1 residual+skip."""
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise dilated conv -> ReLU -> cLN -> pointwise 1×1. Causal via left-pad + chomp."""
 
-    def __init__(self, input_channel, hidden_channel, kernel, padding,
-                 dilation=1, skip=True, causal=False):
+    def __init__(self, in_ch: int, out_ch: int, kernel: int, dilation: int, causal: bool = True):
         super().__init__()
         self.causal = causal
-        self.skip = skip
+        self.padding = (kernel - 1) * dilation if causal else (kernel - 1) * dilation // 2
+        self.depthwise = nn.Conv1d(in_ch, in_ch, kernel, dilation=dilation,
+                                   padding=self.padding, groups=in_ch, bias=False)
+        self.relu = nn.ReLU()
+        self.norm = ChannelwiseLayerNorm(in_ch)
+        self.pointwise = nn.Conv1d(in_ch, out_ch, 1, bias=False)
 
-        self.conv1d = nn.Conv1d(input_channel, hidden_channel, 1)
-        # Causal: pad only on the left (size = (kernel-1)*dilation), then slice off the right tail
-        # so the receptive field stays in the past.
-        self.padding = (kernel - 1) * dilation if causal else padding
-        self.dconv1d = nn.Conv1d(hidden_channel, hidden_channel, kernel,
-                                 dilation=dilation, groups=hidden_channel,
-                                 padding=self.padding)
-        self.res_out = nn.Conv1d(hidden_channel, input_channel, 1)
-        self.nonlinearity1 = nn.PReLU()
-        self.nonlinearity2 = nn.PReLU()
-        if causal:
-            self.reg1 = cLN(hidden_channel)
-            self.reg2 = cLN(hidden_channel)
-        else:
-            self.reg1 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
-            self.reg2 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
-        if skip:
-            self.skip_out = nn.Conv1d(hidden_channel, input_channel, 1)
-
-    def forward(self, input):
-        # input: (B, C_in, L)
-        output = self.reg1(self.nonlinearity1(self.conv1d(input)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.depthwise(x)
         if self.causal:
-            output = self.reg2(self.nonlinearity2(self.dconv1d(output)[:, :, :-self.padding]))
-        else:
-            output = self.reg2(self.nonlinearity2(self.dconv1d(output)))
-        residual = self.res_out(output)
-        if self.skip:
-            return residual, self.skip_out(output)
-        return residual
+            out = out[:, :, :-self.padding]
+        return self.pointwise(self.norm(self.relu(out)))
 
 
-class TCN(nn.Module):
-    """Stacked dilated TCN: `stack` repeats of `layer` blocks with dilation 1,2,4,...,2^(layer-1)."""
+class TemporalBlock(nn.Module):
+    """1×1 (B->H) -> ReLU -> cLN -> DepthwiseSeparableConv (H->B) with residual add."""
 
-    def __init__(self, input_dim, output_dim, BN_dim, hidden_dim,
-                 layer, stack, kernel=3, skip=True, causal=False, dilated=True):
+    def __init__(self, B: int, H: int, kernel: int, dilation: int, causal: bool = True):
         super().__init__()
-        # input: (B, N=input_dim, L)
-        self.LN = cLN(input_dim) if causal else nn.GroupNorm(1, input_dim, eps=1e-8)
-        self.BN = nn.Conv1d(input_dim, BN_dim, 1)
+        self.conv1x1 = nn.Conv1d(B, H, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.norm = ChannelwiseLayerNorm(H)
+        self.dsconv = DepthwiseSeparableConv(H, B, kernel, dilation, causal=causal)
 
-        self.dilated = dilated
-        self.skip = skip
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.dsconv(self.norm(self.relu(self.conv1x1(x))))
+        return out + x[:, :, -out.size(-1):]
+
+
+class TemporalConvNet(nn.Module):
+    """cLN -> 1×1 bottleneck -> R repeats of X dilated blocks -> 1×1 mask projection -> ReLU."""
+
+    def __init__(self, N: int, B: int, H: int, P: int, X: int, R: int, C: int,
+                 causal: bool = True):
+        super().__init__()
+        self.C = C
+        self.layer_norm = ChannelwiseLayerNorm(N)
+        self.bottleneck = nn.Conv1d(N, B, 1, bias=False)
+        self.blocks = nn.ModuleList()
         self.receptive_field = 0
-        self.TCN = nn.ModuleList()
-        for s in range(stack):
-            for i in range(layer):
-                dilation = 2 ** i if dilated else 1
-                padding = 2 ** i if dilated else 1
-                self.TCN.append(DepthConv1d(BN_dim, hidden_dim, kernel,
-                                            dilation=dilation, padding=padding,
-                                            skip=skip, causal=causal))
-                if i == 0 and s == 0:
-                    self.receptive_field += kernel
+        for r in range(R):
+            for x in range(X):
+                dilation = 2 ** x
+                self.blocks.append(TemporalBlock(B, H, P, dilation, causal=causal))
+                if r == 0 and x == 0:
+                    self.receptive_field += P
                 else:
-                    self.receptive_field += (kernel - 1) * (2 ** i if dilated else 1)
+                    self.receptive_field += (P - 1) * dilation
+        self.mask_conv = nn.Conv1d(B, C * N, 1, bias=False)
 
-        # output is nn.Sequential — keys are .output.0 (PReLU) / .output.1 (Conv1d); keep as-is.
-        self.output = nn.Sequential(nn.PReLU(), nn.Conv1d(BN_dim, output_dim, 1))
+    def forward(self, mixture_w: torch.Tensor) -> torch.Tensor:
+        # mixture_w: (M, N, K) -> (M, C, N, K)
+        M, _, K = mixture_w.size()
+        x = self.bottleneck(self.layer_norm(mixture_w))
+        for block in self.blocks:
+            x = block(x)
+        score = self.mask_conv(x)                       # (M, C·N, K)
+        return F.relu(score).view(M, self.C, -1, K)     # (M, C, N, K)
 
-    def forward(self, input):
-        # input: (B, N, L) -> output: (B, N*C, L)
-        output = self.BN(self.LN(input))
-        if self.skip:
-            skip_connection = 0.
-            for block in self.TCN:
-                residual, skip = block(output)
-                output = output + residual
-                skip_connection = skip_connection + skip
-            return self.output(skip_connection)
-        for block in self.TCN:
-            output = output + block(output)
-        return self.output(output)
+
+class Encoder(nn.Module):
+    """Non-overlapping windowed Conv1d with ReLU. (B, 1, T) -> (B, N, K=T/L)."""
+
+    def __init__(self, L: int, N: int, input_channels: int = 1):
+        super().__init__()
+        self.conv = nn.Conv1d(input_channels, N, kernel_size=L, stride=L, bias=False)
+
+    def forward(self, mixture: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.conv(mixture))
+
+
+class Decoder(nn.Module):
+    """Per-frame basis Linear(N -> L), then concatenate L-sample windows. Inverts the encoder."""
+
+    def __init__(self, N: int, L: int):
+        super().__init__()
+        self.basis = nn.Linear(N, L, bias=False)
+
+    def forward(self, mixture_w: torch.Tensor, est_mask: torch.Tensor) -> torch.Tensor:
+        # mixture_w: (M, N, K)   est_mask: (M, C, N, K)
+        M, C = est_mask.size(0), est_mask.size(1)
+        source_w = mixture_w.unsqueeze(1) * est_mask                # (M, C, N, K)
+        source_w = source_w.transpose(2, 3)                         # (M, C, K, N)
+        est_source = self.basis(source_w)                           # (M, C, K, L)
+        return est_source.reshape(M, C, -1)                         # (M, C, K·L)
 
 
 class TasNet(nn.Module):
-    # train.py uses: TasNet(num_spk=2, causal=True, sr=16000)
-    def __init__(self, enc_dim=512, feature_dim=128, sr=16000, win=2,
-                 layer=8, stack=3, kernel=3, num_spk=2, causal=False):
+    """Causal Conv-TasNet, ClearBuds-shape defaults (N=256, L=40, B=256, H=512, P=3, X=8, R=4); C=1 by default."""
+
+    def __init__(self, N: int = 256, L: int = 40, B: int = 256, H: int = 512,
+                 P: int = 3, X: int = 8, R: int = 4, C: int = 1, causal: bool = True,
+                 sr: int = 16000):
         super().__init__()
-        self.num_spk = num_spk
-        self.enc_dim = enc_dim
-        self.feature_dim = feature_dim
-        self.win = int(sr * win / 1000)   # samples per encoder frame
-        self.stride = self.win // 2       # 50% overlap
-        self.layer = layer
-        self.stack = stack
-        self.kernel = kernel
+        self.N, self.L, self.B, self.H = N, L, B, H
+        self.P, self.X, self.R, self.C = P, X, R, C
         self.causal = causal
+        self.sr = sr
+        self.stride = L  # exposed for train.py diagnostics; ClearBuds uses non-overlapping windows
 
-        self.encoder = nn.Conv1d(1, enc_dim, self.win, bias=False, stride=self.stride)
-        self.TCN = TCN(enc_dim, enc_dim * num_spk, feature_dim, feature_dim * 4,
-                       layer, stack, kernel, causal=causal)
-        self.receptive_field = self.TCN.receptive_field
-        self.decoder = nn.ConvTranspose1d(enc_dim, 1, self.win, bias=False, stride=self.stride)
+        self.encoder = Encoder(L, N)
+        self.separator = TemporalConvNet(N, B, H, P, X, R, C, causal=causal)
+        self.decoder = Decoder(N, L)
+        self.receptive_field = self.separator.receptive_field
 
-    def pad_signal(self, input):
-        # (B, T) or (B, 1, T) -> (B, 1, T_pad) so encoder convs stride cleanly.
-        if input.dim() not in (2, 3):
-            raise RuntimeError("Input can only be 2 or 3 dimensional.")
-        if input.dim() == 2:
-            input = input.unsqueeze(1)
-        batch_size, _, nsample = input.size()
-        rest = self.win - (self.stride + nsample % self.win) % self.win
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_normal_(p)
+
+    def _pad(self, x: torch.Tensor):
+        # (B, T) or (B, 1, T) -> (B, 1, T_pad) where T_pad is a multiple of L.
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        T = x.size(-1)
+        rest = (-T) % self.L
         if rest > 0:
-            pad = torch.zeros(batch_size, 1, rest, device=input.device, dtype=input.dtype)
-            input = torch.cat([input, pad], 2)
-        pad_aux = torch.zeros(batch_size, 1, self.stride, device=input.device, dtype=input.dtype)
-        input = torch.cat([pad_aux, input, pad_aux], 2)
-        return input, rest
+            x = F.pad(x, (0, rest))
+        return x, T
 
-    def forward(self, input):
-        # (B, T) -> (B, C, T) where C = num_spk
-        output, rest = self.pad_signal(input)          # (B, 1, T_pad)
-        batch_size = output.size(0)
-
-        enc_output = self.encoder(output)              # (B, N, L)
-        masks = torch.sigmoid(self.TCN(enc_output)).view(
-            batch_size, self.num_spk, self.enc_dim, -1)  # (B, C, N, L)
-        masked_output = enc_output.unsqueeze(1) * masks  # (B, C, N, L)
-
-        output = self.decoder(masked_output.view(batch_size * self.num_spk, self.enc_dim, -1))
-        output = output[:, :, self.stride:-(rest + self.stride)].contiguous()  # trim padding
-        return output.view(batch_size, self.num_spk, -1)  # (B, C, T)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, T) or (B, 1, T) -> (B, C, T)
+        x, T = self._pad(x)
+        enc = self.encoder(x)                  # (B, N, K)
+        mask = self.separator(enc)             # (B, C, N, K)
+        out = self.decoder(enc, mask)          # (B, C, K·L)
+        return out[:, :, :T]

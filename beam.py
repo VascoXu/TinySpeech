@@ -1,15 +1,19 @@
-"""Render multi-mic beamformed scenes for the post-filter training preview.
+"""Render multi-mic beamformed scenes — ClearBuds-style reproduction.
 
-3D ShoeBox + linear mic array + target + 1-3 babble talkers + env noise.
-Per-source rendering keeps SIR/SNR controllable. Beamforming is MVDR in the
-STFT domain with an anechoic-geometry steering vector and an oracle noise
-covariance (from babble + env signals — in deployment this becomes a
-VAD-gated estimate, but the rest of the code stays the same).
+Matches the ClearBuds (clearbuds_waveform/generate_dataset.py) data recipe:
+  - 2D polygon room, walls in ±[15, 20] m  (i.e. 30-40 m floor)
+  - 4-mic circular array, radius 5-12.5 cm, centered at origin
+  - Target voice at array center (0, 0)
+  - K=3 babble talkers at uniform random angle, radius 1-5 m
+  - Background noise rendered in a SEPARATE larger room (walls ±[20, 40] m)
+    at radius 10-20 m — keeps reverb diffuse, matches their pipeline
+  - Per-source peak normalization: foreground ∈ [0.15, 0.4], background ∈ [0.2, 0.5]
+  - Absorption ∈ [0.1, 0.99] uniform, max_order=10 (fixed)
+  - 3-second mixtures
 
-Outputs 6 wavs per example so the user can listen to each component pre- and
-post-beamform, plus prints SI-SDR(mic0→reverb_target) vs SI-SDR(beam→same)
-so the gap (what beamforming buys *before* the post-filter sees anything) is
-visible.
+The MVDR+post-filter pipeline (our AR-glasses architecture) sits on top:
+  MVDR with all-ones steering (target at array center → omnidirectional, all
+  mics see target with zero delay) + oracle noise covariance.
 """
 import argparse
 import random
@@ -20,123 +24,106 @@ import pyroomacoustics as pra
 import torch
 from torchcodec.encoders import AudioEncoder
 
-from dataset import (
-    DATASETS, BABBLE_GAIN_RANGE, SR,
-    list_speech_files, load_mono, random_segment, rms,
-)
+from dataset import DATASETS, SR, list_speech_files, load_mono, random_segment
 from metrics import calc_sdr_torch
-from rir import ROOM_DIM_RANGE, WALL_MARGIN
 
-CEILING_RANGE = (2.5, 3.5)        # 3D ceiling height range (meters)
-Z_MARGIN = 0.3                    # floor/ceiling margin for source placement (meters)
-SOURCE_Z_JITTER = 0.2             # source z ~ mic_height ± this (meters; head-height variation)
-SPEED_OF_SOUND = 343.0            # m/s — used for MVDR steering-vector geometric delays
-MVDR_N_FFT = 1024                 # 64 ms @ 16 kHz; 75% overlap (hop=256)
+# ---- Room geometry (ClearBuds-style 2D polygon) ----
+FG_WALL_HALF_MIN = 15.0           # FG room walls in ±[15, 20] m
+FG_WALL_HALF_MAX = 20.0
+BG_WALL_HALF_MIN = 20.0           # BG room walls in ±[20, 40] m  (separate larger room)
+BG_WALL_HALF_MAX = 40.0
+FG_ABSORPTION_RANGE = (0.1, 0.99)
+BG_ABSORPTION_RANGE = (0.5, 0.99) # more absorptive → diffuse-sounding distant noise (ClearBuds)
+MAX_ORDER = 10
+
+# ---- Mic array ----
+MIC_RADIUS_RANGE = (0.05, 0.125)  # circular array radius (m)
+N_MICS_DEFAULT = 4
+MIC_PHI0 = 0.0                    # starting angle of first mic
+
+# ---- Sources ----
+BABBLE_K_RANGE = (1, 3)           # random number of babble talkers per example
+BABBLE_RADIUS_RANGE = (1.0, 5.0)
+BG_RADIUS_RANGE = (10.0, 20.0)
+
+# ---- Volumes (peak normalization, ClearBuds-style) ----
+FG_VOL_RANGE = (0.15, 0.4)
+BG_VOL_RANGE = (0.2, 0.5)
+
+# ---- MVDR ----
+MVDR_N_FFT = 1024
 MVDR_HOP = 256
-MVDR_DIAG_LOAD = 1e-6             # diagonal-loading ε for noise-cov regularization
-
-TARGET_ANGLE_JITTER = 8.0         # target sits at boresight (90°) ± this
-TARGET_DIST_RANGE = (1.0, 2.0)
-BABBLE_K_RANGE = (1, 3)
-BABBLE_DIST_RANGE = (1.0, 3.5)
-BABBLE_NEAR_TARGET_DEG = 15.0     # at least one babble forced within ± this of target (co-directional)
-BABBLE_FAR_ANGLE_RANGE = (30.0, 150.0)
-ENV_DIST_RANGE = (1.5, 4.0)
-ENV_ANGLE_RANGE = (30.0, 150.0)
+MVDR_DIAG_LOAD = 1e-3
+MVDR_DIAG_FLOOR = 1e-8
 
 
-def sample_room(rt60_range):
-    """Sample a 3D ShoeBox + valid Sabine materials. Retry on infeasible (room, RT60) combos."""
-    while True:
-        room_dim = [
-            random.uniform(*ROOM_DIM_RANGE),
-            random.uniform(*ROOM_DIM_RANGE),
-            random.uniform(*CEILING_RANGE),
-        ]
-        rt60 = random.uniform(*rt60_range)
-        try:
-            e_abs, max_order = pra.inverse_sabine(rt60, room_dim)
-            return room_dim, e_abs, max_order, rt60
-        except ValueError:
-            continue
+def sample_room(half_min, half_max, absorption_range=FG_ABSORPTION_RANGE):
+    """ClearBuds-style: 4-corner 2D polygon with walls in ±[half_min, half_max]."""
+    lw = -random.uniform(half_min, half_max)
+    rw =  random.uniform(half_min, half_max)
+    bw = -random.uniform(half_min, half_max)
+    tw =  random.uniform(half_min, half_max)
+    corners = np.array([[lw, bw], [lw, tw], [rw, tw], [rw, bw]]).T   # (2, 4)
+    absorption = random.uniform(*absorption_range)
+    return corners, absorption
 
 
-def place_array(room_dim, n_mics, spacing, height):
-    """Linear array along x-axis at `height`. Returns (mic_positions (3, M), center (cx, cy, ch))."""
-    cx = random.uniform(WALL_MARGIN, room_dim[0] - WALL_MARGIN)
-    cy = random.uniform(WALL_MARGIN, room_dim[1] - WALL_MARGIN)
-    ch = float(height)
-    offsets = (np.arange(n_mics) - (n_mics - 1) / 2.0) * spacing
-    xs = cx + offsets
-    ys = np.full(n_mics, cy)
-    zs = np.full(n_mics, ch)
-    return np.stack([xs, ys, zs], axis=0), (cx, cy, ch)
+def place_circular_array(n_mics, mic_radius):
+    """ClearBuds-style 2D circular array centered at origin. Returns (2, n_mics)."""
+    return pra.circular_2D_array(center=[0.0, 0.0], M=n_mics, phi0=MIC_PHI0, radius=mic_radius)
 
 
-def place_source(center, angle_deg, dist, room_dim):
-    """Polar (horizontal angle, distance) + z-jitter around mic height -> clamped (x, y, z)."""
-    cx, cy, ch = center
-    rad = np.deg2rad(angle_deg)
-    x = cx + dist * np.cos(rad)
-    y = cy + dist * np.sin(rad)
-    z = ch + random.uniform(-SOURCE_Z_JITTER, SOURCE_Z_JITTER)
-    x = float(np.clip(x, WALL_MARGIN, room_dim[0] - WALL_MARGIN))
-    y = float(np.clip(y, WALL_MARGIN, room_dim[1] - WALL_MARGIN))
-    z = float(np.clip(z, Z_MARGIN, room_dim[2] - Z_MARGIN))
-    return [x, y, z]
-
-
-def render_to_mics(audio, src_pos, mic_positions, room_dim, e_abs, max_order):
-    """Per-source render: one-source pra ShoeBox, return (M, T) mic signals cropped to input length."""
-    room = pra.ShoeBox(room_dim, fs=SR, materials=pra.Material(e_abs), max_order=max_order)
-    room.add_microphone_array(mic_positions)
-    room.add_source(src_pos, signal=audio.numpy())
+def render_to_mics(audio, src_pos, mic_positions, corners, absorption, n_samples):
+    """Render a single source to all mics in a 2D polygon room. Returns (M, T_render) cropped."""
+    room = pra.Room.from_corners(corners, fs=SR, max_order=MAX_ORDER,
+                                 materials=pra.Material(absorption))
+    room.add_microphone_array(pra.MicrophoneArray(mic_positions, room.fs))
+    room.add_source(list(src_pos), signal=audio.numpy())
+    room.image_source_model()
     room.simulate()
-    sig = torch.from_numpy(room.mic_array.signals).float()       # (M, T_render)
-    return sig[:, :audio.size(0)]
+    sig = torch.from_numpy(room.mic_array.signals).float()
+    return sig[:, :n_samples]
 
 
-def compute_mvdr_weights(noise_mic, mic_positions, target_angle_deg,
-                         n_fft=MVDR_N_FFT, hop=MVDR_HOP, diag_load=MVDR_DIAG_LOAD):
-    """MVDR weights per frequency bin from an oracle noise estimate + anechoic steering vector.
+def peak_normalize(sig, target_peak):
+    """Scale signal so its abs().max() == target_peak. Pass-through if signal is near-zero."""
+    peak = sig.abs().max()
+    if peak < 1e-9:
+        return sig
+    return sig * (target_peak / peak)
 
-    noise_mic       : (M, T) noise-only signal (in preview: babble_mic + env_mic; in production:
-                              VAD-gated noise segments).
-    mic_positions   : (3, M) absolute 3D mic coords.
-    target_angle_deg: azimuth in degrees; 90° = +y axis = boresight.
-    Returns (F, M) complex weights where F = n_fft // 2 + 1.
+
+def compute_mvdr_weights(noise_mic, n_fft=MVDR_N_FFT, hop=MVDR_HOP,
+                         diag_load=MVDR_DIAG_LOAD, diag_floor=MVDR_DIAG_FLOOR):
+    """MVDR weights with all-ones steering (target at array center → omnidirectional).
+
+    noise_mic: (M, T) noise-only signal (oracle = babble + env). Returns (F, M) complex weights.
     """
     M = noise_mic.shape[0]
     window = torch.hann_window(n_fft)
     N = torch.stft(noise_mic, n_fft=n_fft, hop_length=hop, win_length=n_fft,
                    window=window, return_complex=True, center=True)        # (M, F, L)
     L_frames = N.shape[-1]
-
-    # Noise covariance Σ_NN(f) = N(f) N(f)^H / L  for each freq bin
     N_fml = N.permute(1, 0, 2)                                              # (F, M, L)
     sigma = (N_fml @ N_fml.conj().transpose(-2, -1)) / L_frames             # (F, M, M)
+
+    # Scale-adaptive diagonal load (low-freq bins are near-rank-1 → singular at float32)
+    trace = sigma.diagonal(dim1=-2, dim2=-1).real.mean(-1)                  # (F,)
+    reg = (diag_load * trace).clamp_min(diag_floor)                         # (F,)
     eye = torch.eye(M, dtype=sigma.dtype).unsqueeze(0)
-    sigma = sigma + diag_load * eye
+    sigma = sigma + reg[:, None, None] * eye
 
-    # Steering vector for plane-wave model: d_k(m) = exp(-j 2π f_k τ_m), τ_m = (r_m · ĥ) / c
-    rad = np.deg2rad(target_angle_deg)
-    direction = torch.tensor([np.cos(rad), np.sin(rad), 0.0], dtype=torch.float32)
-    mics = torch.from_numpy(mic_positions).float()
-    rel = mics - mics.mean(dim=1, keepdim=True)                             # (3, M)
-    tau = (direction @ rel) / SPEED_OF_SOUND                                # (M,)
-    freqs = torch.fft.rfftfreq(n_fft, d=1.0 / SR)                           # (F,)
-    phase = -2 * np.pi * freqs.unsqueeze(1) * tau.unsqueeze(0)              # (F, M)
-    d = torch.exp(1j * phase).to(sigma.dtype)                               # (F, M)
-
-    # w_k = Σ⁻¹ d_k / (d_k^H Σ⁻¹ d_k)
-    d_col = d.unsqueeze(-1)                                                 # (F, M, 1)
-    sigma_inv_d = torch.linalg.solve(sigma, d_col)                          # (F, M, 1)
-    denom = (d_col.conj().transpose(-2, -1) @ sigma_inv_d).squeeze(-1).squeeze(-1)  # (F,)
+    # Target at array center → zero-delay across all mics → steering = all-ones
+    F_bins = N.shape[1]
+    d = torch.ones(F_bins, M, dtype=sigma.dtype)                            # (F, M)
+    d_col = d.unsqueeze(-1)
+    sigma_inv_d = torch.linalg.solve(sigma, d_col)
+    denom = (d_col.conj().transpose(-2, -1) @ sigma_inv_d).squeeze(-1).squeeze(-1)
     return sigma_inv_d.squeeze(-1) / denom.unsqueeze(-1)                    # (F, M)
 
 
 def beamform_mvdr(multi_mic, weights, n_fft=MVDR_N_FFT, hop=MVDR_HOP):
-    """Apply per-bin MVDR weights to a (M, T) multi-mic signal. Returns (T,)."""
+    """Apply per-bin MVDR weights to a (M, T) signal. Returns (T,)."""
     length = multi_mic.shape[1]
     window = torch.hann_window(n_fft)
     X = torch.stft(multi_mic, n_fft=n_fft, hop_length=hop, win_length=n_fft,
@@ -145,8 +132,6 @@ def beamform_mvdr(multi_mic, weights, n_fft=MVDR_N_FFT, hop=MVDR_HOP):
     Y = (weights.conj().unsqueeze(-1) * X_fml).sum(dim=1)                   # (F, L)
     return torch.istft(Y, n_fft=n_fft, hop_length=hop, win_length=n_fft,
                        window=window, center=True, length=length)
-
-
 
 
 def main(args):
@@ -158,96 +143,71 @@ def main(args):
     print(f"dataset: {', '.join(args.dataset)}")
     speech_files = list_speech_files(speech_roots)
     noise_files = sorted(Path(args.wham_root).rglob("*.wav"))
-    assert speech_files, f"no .flac files under {speech_roots}"
-    assert noise_files, f"no .wav files under {args.wham_root}"
+    assert speech_files, f"no .flac under {speech_roots}"
+    assert noise_files, f"no .wav under {args.wham_root}"
 
     n_samples = int(SR * args.segment_seconds)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     sdr_gaps = []
     for i in range(args.n_examples):
-        room_dim, e_abs, max_order, rt60 = sample_room(args.rt60_range)
-        mic_positions, center = place_array(room_dim, args.n_mics, args.mic_spacing, args.mic_height)
+        # Foreground room + array
+        fg_corners, fg_absorption = sample_room(FG_WALL_HALF_MIN, FG_WALL_HALF_MAX)
+        mic_radius = random.uniform(*MIC_RADIUS_RANGE)
+        mic_positions = place_circular_array(args.n_mics, mic_radius)
 
-        # Source geometry
-        target_angle = 90.0 + random.uniform(-TARGET_ANGLE_JITTER, TARGET_ANGLE_JITTER)
-        target_dist  = random.uniform(*TARGET_DIST_RANGE)
-
-        k = random.randint(*BABBLE_K_RANGE)
-        # First babble forced co-directional with target (the hard residual)
-        babble_angles = [target_angle + random.uniform(-BABBLE_NEAR_TARGET_DEG, BABBLE_NEAR_TARGET_DEG)]
-        babble_dists  = [random.uniform(*BABBLE_DIST_RANGE)]
-        for _ in range(k - 1):
-            babble_angles.append(random.uniform(*BABBLE_FAR_ANGLE_RANGE))
-            babble_dists.append(random.uniform(*BABBLE_DIST_RANGE))
-
-        env_angle = random.uniform(*ENV_ANGLE_RANGE)
-        env_dist  = random.uniform(*ENV_DIST_RANGE)
-
-        # Audio
+        # Target at origin (array center)
         target_audio = random_segment(load_mono(random.choice(speech_files), SR), n_samples)
-        babble_audios = [random_segment(load_mono(random.choice(speech_files), SR), n_samples)
-                         for _ in range(k)]
-        env_audio = random_segment(load_mono(random.choice(noise_files), SR), n_samples)
+        target_mic = render_to_mics(target_audio, [0.0, 0.0],
+                                    mic_positions, fg_corners, fg_absorption, n_samples)
+        target_mic = peak_normalize(target_mic, random.uniform(*FG_VOL_RANGE))
 
-        # Per-source mic signals — each source rendered in its own ShoeBox (separable for SIR/SNR)
-        target_mic = render_to_mics(
-            target_audio, place_source(center, target_angle, target_dist, room_dim),
-            mic_positions, room_dim, e_abs, max_order)
+        # K babble talkers at random angles in the same room
+        babble_mics_per_src = []
+        babble_angles = []
+        k = random.randint(*BABBLE_K_RANGE)
+        for _ in range(k):
+            audio = random_segment(load_mono(random.choice(speech_files), SR), n_samples)
+            r = random.uniform(*BABBLE_RADIUS_RANGE)
+            theta = random.uniform(0, 2 * np.pi)
+            babble_angles.append(np.degrees(theta))
+            sig = render_to_mics(audio, [r * np.cos(theta), r * np.sin(theta)],
+                                 mic_positions, fg_corners, fg_absorption, n_samples)
+            babble_mics_per_src.append(peak_normalize(sig, random.uniform(*FG_VOL_RANGE)))
+        babble_mic = sum(babble_mics_per_src)   # plain sum (ClearBuds doesn't divide by sqrt(K))
 
-        babble_mics_per_src = [
-            render_to_mics(b, place_source(center, a, d, room_dim),
-                           mic_positions, room_dim, e_abs, max_order)
-            for b, a, d in zip(babble_audios, babble_angles, babble_dists)
-        ]
-        env_mic = render_to_mics(
-            env_audio, place_source(center, env_angle, env_dist, room_dim),
-            mic_positions, room_dim, e_abs, max_order)
-
-        # Stack + RMS-normalize babble across the K talkers (matches DynamicSpeechDataset)
-        babble_gains = [random.uniform(*BABBLE_GAIN_RANGE) for _ in range(k)]
-        babble_mic = sum(b * g for b, g in zip(babble_mics_per_src, babble_gains)) / (k ** 0.5)
-
-        # SIR / SNR scaling — derive scale from the across-mic mean, apply uniformly across mics
-        sir_db = random.uniform(*args.sir_db_range)
-        snr_db = random.uniform(*args.snr_db_range)
-        babble_scale = rms(target_mic.mean(0)) / (rms(babble_mic.mean(0)) * 10 ** (sir_db / 20))
-        env_scale    = rms(target_mic.mean(0)) / (rms(env_mic.mean(0))    * 10 ** (snr_db / 20))
-        babble_mic = babble_mic * babble_scale
-        env_mic    = env_mic    * env_scale
+        # Background noise — separate larger room, distant source
+        bg_corners, bg_absorption = sample_room(BG_WALL_HALF_MIN, BG_WALL_HALF_MAX, BG_ABSORPTION_RANGE)
+        bg_audio = random_segment(load_mono(random.choice(noise_files), SR), n_samples)
+        bg_r = random.uniform(*BG_RADIUS_RANGE)
+        bg_theta = random.uniform(0, 2 * np.pi)
+        env_mic = render_to_mics(bg_audio, [bg_r * np.cos(bg_theta), bg_r * np.sin(bg_theta)],
+                                 mic_positions, bg_corners, bg_absorption, n_samples)
+        env_mic = peak_normalize(env_mic, random.uniform(*BG_VOL_RANGE))
 
         multi_mic = target_mic + babble_mic + env_mic       # (M, T)
 
-        # MVDR weights are computed once per scene from oracle noise (babble + env), then
-        # applied to multi_mic and each per-source path (linear operator → consistent decomp).
-        mvdr_w = compute_mvdr_weights(babble_mic + env_mic, mic_positions, target_angle)
-        beam        = beamform_mvdr(multi_mic,  mvdr_w)
+        # MVDR with all-ones steering, oracle noise = babble + env
+        mvdr_w = compute_mvdr_weights(babble_mic + env_mic)
+        beam        = beamform_mvdr(multi_mic, mvdr_w)
         beam_target = beamform_mvdr(target_mic, mvdr_w)
         beam_babble = beamform_mvdr(babble_mic, mvdr_w)
         beam_env    = beamform_mvdr(env_mic,    mvdr_w)
 
-        # Diagnostics — SI-SDR uses the *reverberant* target as reference (target-only signal at
-        # the array), so the metric isolates "did the beamformer suppress interference?" from
-        # "is reverb still there?". Vs anechoic target the propagation-delay misalignment and
-        # reverb mismatch swamp the gap. Anechoic target stays the eventual training label —
-        # this is only the beamformer's sanity check.
+        # Diagnostics — SI-SDR against the reverberant target as each signal sees it
         mic0_raw = multi_mic[0]
         sdr_mic0 = calc_sdr_torch(mic0_raw.unsqueeze(0), target_mic[0].unsqueeze(0)).item()
         sdr_beam = calc_sdr_torch(beam.unsqueeze(0),     beam_target.unsqueeze(0)).item()
         gap = sdr_beam - sdr_mic0
         sdr_gaps.append(gap)
 
-        babble_angle_str = ", ".join(f"{a:.1f}°" for a in babble_angles)
         print(
-            f"[{i:02d}] RT60={rt60:.2f}s  "
-            f"room=({room_dim[0]:.1f}×{room_dim[1]:.1f}×{room_dim[2]:.1f})m  "
-            f"target={target_angle:.1f}°  babble=[{babble_angle_str}]  env={env_angle:.1f}°\n"
-            f"     SIR={sir_db:+.1f}dB  SNR={snr_db:+.1f}dB  K={k}\n"
+            f"[{i:02d}] mics={args.n_mics}@{mic_radius*100:.1f}cm  absorption={fg_absorption:.2f}  "
+            f"babble_θ=[{', '.join(f'{a:.0f}°' for a in babble_angles)}]  bg_dist={bg_r:.1f}m\n"
             f"     SI-SDR(mic0→reverb_target) = {sdr_mic0:+6.2f} dB\n"
             f"     SI-SDR(beam →reverb_target) = {sdr_beam:+6.2f} dB   gain = {gap:+.2f} dB"
         )
 
-        # Save 6 wavs with shared peak normalization for fair listening
         components = {
             "1_target_anechoic":   target_audio,
             "2_mic0_raw":          mic0_raw,
@@ -274,16 +234,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", nargs="+", choices=sorted(DATASETS.keys()), required=True,
                    metavar="NAME",
-                   help=f"Speech dataset(s) for target+babble. Choices: {sorted(DATASETS.keys())}")
+                   help=f"Speech dataset(s). Choices: {sorted(DATASETS.keys())}")
     p.add_argument("--wham-root", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, default=Path("preview_beam"))
     p.add_argument("--n-examples", type=int, default=5)
-    p.add_argument("--n-mics", type=int, default=2)
-    p.add_argument("--mic-spacing", type=float, default=0.14, help="meters")
-    p.add_argument("--mic-height", type=float, default=1.5, help="z of mic array, meters")
-    p.add_argument("--segment-seconds", type=float, default=4.0)
-    p.add_argument("--sir-db-range", type=float, nargs=2, default=[-5.0, 10.0])
-    p.add_argument("--snr-db-range", type=float, nargs=2, default=[0.0, 15.0])
-    p.add_argument("--rt60-range", type=float, nargs=2, default=[0.2, 0.6])
+    p.add_argument("--n-mics", type=int, default=N_MICS_DEFAULT)
+    p.add_argument("--segment-seconds", type=float, default=3.0)   # ClearBuds default
     p.add_argument("--seed", type=int, default=42)
     main(p.parse_args())

@@ -11,7 +11,7 @@ from rir import fft_convolve
 SR = 16000
 SNR_DB_DEFAULT = (-5.0, 15.0)         # voice-vs-interference SNR drawn uniformly
 GAIN_DB_DEFAULT = (-15.0, 5.0)        # final per-sample gain (simulates mic-distance variation)
-BABBLE_N_DEFAULT = (3, 10)            # number of stacked interfering voices
+BABBLE_N_DEFAULT = (3, 6)             # number of stacked interfering voices
 BABBLE_GAIN_RANGE = (0.5, 1.0)        # per-voice gain inside the babble stack
 
 # Dataset registry — short name -> speech root. Lets train.py take --dataset vctk librispeech
@@ -116,16 +116,26 @@ class DynamicSpeechDataset(Dataset):
 
 
 class ProcessedSpeechDataset(Dataset):
-    """Pre-rendered (noisy, sources) pairs from a .pt file (see prepare.py)."""
+    """Pre-rendered (noisy, target) pairs from a .pt file.
+
+    New format (beam_prepare.py): {"noisy": (N,T), "target": (N,T)} — single target.
+    Legacy (prepare.py):           {"noisy": (N,T), "sources": (N,2,T)} — [target, interference].
+    Legacy is auto-flattened to target = sources[:, 0].
+    """
 
     def __init__(self, pt_path: Path):
         blob = torch.load(pt_path, map_location="cpu")
         self.noisy = blob["noisy"]
-        self.sources = blob["sources"]
-        assert self.noisy.size(0) == self.sources.size(0)
+        if "target" in blob:
+            self.target = blob["target"]
+        elif "sources" in blob:
+            self.target = blob["sources"][:, 0]
+        else:
+            raise KeyError(f"{pt_path}: expected 'target' or 'sources' key")
+        assert self.noisy.size(0) == self.target.size(0)
 
     def __len__(self) -> int:
         return self.noisy.size(0)
 
     def __getitem__(self, idx: int):
-        return self.noisy[idx], self.sources[idx]
+        return self.noisy[idx], self.target[idx]

@@ -10,7 +10,6 @@ from metrics import calc_sdr_torch
 from model import TasNet
 
 SR = 16000
-TARGET_STREAM = 1   # empirical per checkpoint — matches eval.py / demo.py
 N_FFT = 1024
 HOP = 256
 DB_RANGE = 80   # displayed dynamic range below the panel peak
@@ -26,16 +25,14 @@ def stft_db(x: torch.Tensor) -> torch.Tensor:
 
 def main(args):
     device = torch.device(args.device)
-    model = TasNet(num_spk=2, causal=True, sr=SR).to(device).eval()
+    model = TasNet(causal=True, sr=SR).to(device).eval()
     model.load_state_dict(torch.load(args.checkpoint, map_location=device)["model"])
 
     ds = ProcessedSpeechDataset(args.test_pt)
-    noisy, sources = ds[args.index]
-    target = sources[0]
+    noisy, target = ds[args.index]
 
     with torch.no_grad():
-        ests = model(noisy.unsqueeze(0).to(device))[0]   # (2, T)
-        est = ests[TARGET_STREAM].cpu()
+        est = model(noisy.unsqueeze(0).to(device))[0, 0].cpu()   # (T,)
 
     sdr_in  = calc_sdr_torch(noisy.unsqueeze(0), target.unsqueeze(0)).item()
     sdr_out = calc_sdr_torch(est.unsqueeze(0),   target.unsqueeze(0)).item()

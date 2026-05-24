@@ -31,7 +31,7 @@ def main(args):
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TasNet(num_spk=2, causal=True, sr=SR).to(device)
+    model = TasNet(causal=True, sr=SR).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model"])
     model.eval()

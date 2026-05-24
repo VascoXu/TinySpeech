@@ -8,50 +8,35 @@ Expects [VCTK-0.92](https://datashare.ed.ac.uk/handle/10283/3443) and [LibriSpee
 
 ## Train
 
+Training inputs are *beamformed* single-channel signals: ClearBuds-style multi-mic 2D-polygon scenes from a pre-rendered RIR bank → MVDR (oracle noise covariance, all-ones steering for target at array origin) → mono. The post-filter is causal Conv-TasNet trained with `L1MultiResSTFTLoss`.
+
 ```bash
-# 1. Render a fixed val set (one-time)
-python prepare.py \
-  --speech-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed \
-  --wham-root datasets/wham_noise
+# 1. Render the multi-mic RIR bank (one-time; see § Multi-mic RIR bank)
+python beam_bank.py --n-scenes 100 --out-pt datasets/rir_bank_beam.pt
 
+# 2. Render a fixed beam-rendered val set (one-time, matches training distribution)
+python beam_prepare.py \
+  --dataset vctk \
+  --wham-root datasets/wham_noise \
+  --beam-bank datasets/rir_bank_beam.pt \
+  --out-pt datasets/val_beam.pt \
+  --target-type reverberant
 
-# 2. Train (multi-corpus: VCTK + LibriSpeech train-clean-360 for OOD robustness)
+# 3. Train
 python train.py \
   --dataset vctk librispeech \
   --wham-root datasets/wham_noise \
-  --val-pt datasets/val_vctk.pt \
+  --beam-bank datasets/rir_bank_beam.pt \
+  --val-pt datasets/val_beam.pt \
+  --target-type reverberant \
   --epochs 100
 ```
+
+`--target-type` controls what the post-filter is asked to predict. `reverberant` (the target as seen at the array, after MVDR) is time-aligned with the beamformed input and turns the task into denoise-only — preferred for hearing-aid use where early reflections aid intelligibility. `anechoic` is the dry voice and asks the post-filter to denoise + dereverb in one shot. The val set must use the same `--target-type` as training.
 
 Dataset name → path mapping lives in `dataset.py:DATASETS`. Add new datasets there.
 
 Resume: add `--resume checkpoints/last.pt`.
-
-## Train with reverb (fine-tune)
-
-Convolves target + babble through random rooms (`pyroomacoustics`). Resume from the dry baseline:
-
-```bash
-# 1. Bake a bank of 2000 random-room RIRs (one-time, ~10 s)
-python rir.py --n-rirs 2000 --out-pt datasets/rir_bank.pt
-
-# 2. Render a matching reverberant val set
-python prepare.py \
-  --speech-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed \
-  --wham-root datasets/wham_noise \
-  --rir-bank datasets/rir_bank.pt \
-  --out-pt datasets/val_vctk_reverb.pt
-
-# 3. Fine-tune from the dry checkpoint
-python train.py \
-  --dataset vctk librispeech \
-  --wham-root datasets/wham_noise \
-  --val-pt datasets/val_vctk_reverb.pt \
-  --rir-bank datasets/rir_bank.pt \
-  --resume checkpoints/best.pt \
-  --ckpt-dir checkpoints_reverb \
-  --epochs 20
-```
 
 ## OOD test set
 
@@ -78,7 +63,7 @@ python eval.py \
 
 ## Beamformer preview
 
-Renders multi-mic 3D-room scenes (target + co-directional babble + env noise), applies MVDR beamforming (oracle noise covariance, anechoic steering from gaze direction), and saves per-component wavs for listening. Used to validate geometry + SIR/SNR conventions for the eventual beamform + post-filter training pipeline (where the post-filter sees beamformed audio, not raw mixtures).
+Renders ClearBuds-style scenes (2D polygon room, 4-mic circular array centered at origin, target at origin, K=3 babble talkers at random angles + radii, env noise in a separate larger room), applies MVDR (all-ones steering, oracle noise covariance), and saves per-component wavs for listening.
 
 ```bash
 python beam.py --dataset vctk librispeech --wham-root datasets/wham_noise
@@ -88,13 +73,16 @@ Outputs to `preview_beam/example_NN/` with 6 wavs per example: dry anechoic targ
 
 ## Multi-mic RIR bank
 
-Pre-render multi-mic RIRs for the future beamform-aware training pipeline. Each scene = random 3D room + mic-array placement + RIRs from a grid of (angle, distance) source positions to each mic. At training time, a `BeamformedSpeechDataset` will sample a scene, pick target/babble/env positions from the grid, fft-convolve audio with the corresponding RIRs, sum per-mic, then beamform.
+Pre-render the RIRs that `SpatialAudioDataset` looks up at training time. Each scene contains two paired rooms — same circular mic array (centered at origin), different acoustics:
+
+- **FG room** (walls ±[15, 20] m): one target RIR at origin + a polar grid of babble RIRs at (angle, radius).
+- **BG room** (walls ±[20, 40] m): a polar grid of env-noise RIRs at (angle, radius).
 
 ```bash
 python beam_bank.py --n-scenes 100 --out-pt datasets/rir_bank_beam.pt
 ```
 
-~6 s per scene at default grid (25 angles × 5 distances × 2 mics × 1 s RIRs ≈ 16 MB/scene). Bank format documented in `beam_bank.py`.
+Defaults: 16 FG angles × 5 FG radii (babble), 8 BG angles × 3 BG radii (env), 4 mics, 1.5 s RIRs → ~25 MB/scene. Bank format documented in `beam_bank.py`.
 
 ## Demo
 

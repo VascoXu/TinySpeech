@@ -1,20 +1,31 @@
-"""Pre-render a multi-mic RIR bank for the beam + post-filter training pipeline.
+"""Pre-render a multi-mic RIR bank for the ClearBuds-style beam + post-filter pipeline.
 
-Each scene = random 3D ShoeBox + random mic-array placement + RIRs from a grid
-of (angle, distance) source positions to each mic. At training time the
-BeamformedSpeechDataset (future) samples a scene, picks target/babble/env
-positions by (angle, distance), looks up the per-mic RIRs, fft-convolves
-audio with each, scales SIR/SNR, sums per-mic, then beamforms.
+Each scene contains two paired rooms — same circular mic array (centered at origin),
+different acoustics — to match beam.py exactly:
+
+  - FG (foreground) room: 2D polygon, walls in ±[15, 20] m. Holds the target RIR
+    (one position at origin) and a grid of babble RIRs at (angle, radius).
+  - BG (background) room: separate larger 2D polygon, walls in ±[20, 40] m.
+    Holds a grid of env-noise RIRs at (angle, radius).
+
+At training time, SpatialAudioDataset samples a scene, convolves the dry target
+with the target_rir, picks random grid points for K babble talkers + 1 env source,
+peak-normalizes each, sums per-mic, MVDR-beamforms, and yields (beamformed, target).
 
 Bank format (one .pt file, list of N_scenes dicts):
-    room_dim:      [Lx, Ly, Lz]              # meters
-    rt60:          float                     # seconds
-    array_center:  [cx, cy, ch]              # mic-array centroid
-    mic_positions: (3, M) tensor             # absolute 3D coords
-    angles:        (N_a,) tensor (degrees)   # desired grid (90 = boresight)
-    distances:     (N_d,) tensor (meters)    # desired grid
-    source_xyz:    (N_a, N_d, 3) tensor      # achieved (clamped) positions
-    rirs:          (N_a, N_d, M, rir_len)    # per-grid-point per-mic impulse response
+    fg_corners:     (2, 4)    # FG-room polygon corners
+    fg_absorption:  float
+    bg_corners:     (2, 4)    # BG-room polygon corners
+    bg_absorption:  float
+    mic_radius:     float
+    mic_positions:  (2, M)    # 2D, circular, centered at origin
+    target_rir:     (M, rir_len)              # FG, source at origin
+    babble_angles:  (N_a,)    degrees
+    babble_radii:   (N_r,)    meters
+    babble_rirs:    (N_a, N_r, M, rir_len)    # FG
+    bg_angles:      (N_a_bg,) degrees
+    bg_radii:       (N_r_bg,) meters
+    bg_rirs:        (N_a_bg, N_r_bg, M, rir_len)  # BG
 """
 import argparse
 import random
@@ -25,19 +36,39 @@ import pyroomacoustics as pra
 import torch
 from tqdm import tqdm
 
-from beam import place_array, place_source, sample_room
+from beam import (
+    BABBLE_RADIUS_RANGE, BG_ABSORPTION_RANGE, BG_RADIUS_RANGE,
+    BG_WALL_HALF_MAX, BG_WALL_HALF_MIN,
+    FG_WALL_HALF_MAX, FG_WALL_HALF_MIN,
+    MAX_ORDER, MIC_RADIUS_RANGE, N_MICS_DEFAULT,
+    place_circular_array, sample_room,
+)
 from dataset import SR
 
 
-def render_scene_rirs(room_dim, e_abs, max_order, mic_positions, source_xyz_flat, rir_len):
-    """One ShoeBox, all sources at once. source_xyz_flat: (N, 3). Returns (N, M, rir_len)."""
-    n_pos, m_mics = source_xyz_flat.shape[0], mic_positions.shape[1]
-    room = pra.ShoeBox(room_dim, fs=SR, materials=pra.Material(e_abs), max_order=max_order)
-    room.add_microphone_array(mic_positions)
-    for pos in source_xyz_flat:
-        room.add_source(pos.tolist())
+def _polar_grid(angles_deg, radii):
+    """Cartesian product of (angle, radius) -> list of (x, y) tuples."""
+    out = []
+    for a in angles_deg:
+        th = float(a) * np.pi / 180.0
+        for r in radii:
+            out.append((float(r) * np.cos(th), float(r) * np.sin(th)))
+    return out
+
+
+def render_grid_rirs(corners, absorption, mic_positions, source_xy, rir_len):
+    """All sources in one room — single image-source pass, then read room.rir[m][i].
+
+    source_xy: list of (x, y). Returns (N, M, rir_len) padded/truncated to rir_len.
+    """
+    room = pra.Room.from_corners(corners, fs=SR, max_order=MAX_ORDER,
+                                 materials=pra.Material(absorption))
+    room.add_microphone_array(pra.MicrophoneArray(mic_positions, room.fs))
+    for pos in source_xy:
+        room.add_source(list(pos))
     room.compute_rir()
 
+    n_pos, m_mics = len(source_xy), mic_positions.shape[1]
     rirs = torch.zeros(n_pos, m_mics, rir_len)
     for i in range(n_pos):
         for m in range(m_mics):
@@ -51,45 +82,59 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    angles = torch.arange(args.angle_start, args.angle_stop + 1e-6, args.angle_step)
-    distances = torch.tensor(args.distances)
-    rir_len = int(args.rir_seconds * SR)
-    n_a, n_d = len(angles), len(distances)
-    bytes_per_scene = n_a * n_d * args.n_mics * rir_len * 4
+    babble_angles = torch.linspace(0.0, 360.0 - 360.0 / args.n_fg_angles, args.n_fg_angles)
+    babble_radii  = torch.linspace(BABBLE_RADIUS_RANGE[0], BABBLE_RADIUS_RANGE[1], args.n_fg_radii)
+    bg_angles     = torch.linspace(0.0, 360.0 - 360.0 / args.n_bg_angles, args.n_bg_angles)
+    bg_radii      = torch.linspace(BG_RADIUS_RANGE[0], BG_RADIUS_RANGE[1], args.n_bg_radii)
 
-    print(f"per-scene grid: {n_a} angles × {n_d} distances = {n_a * n_d} positions")
-    print(f"mics: {args.n_mics} @ {args.mic_spacing}m, RIR len: {rir_len} samples ({args.rir_seconds}s)")
-    print(f"~{bytes_per_scene / 1e6:.1f} MB per scene -> ~{bytes_per_scene * args.n_scenes / 1e9:.2f} GB total")
+    n_a, n_r        = len(babble_angles), len(babble_radii)
+    n_a_bg, n_r_bg  = len(bg_angles), len(bg_radii)
+    rir_len = int(args.rir_seconds * SR)
+
+    floats_per_scene = (1 + n_a * n_r + n_a_bg * n_r_bg) * args.n_mics * rir_len
+    bytes_per_scene = floats_per_scene * 4
+
+    print(f"FG grid: {n_a} angles × {n_r} radii = {n_a*n_r} babble positions  "
+          f"(+ 1 target @ origin) in room walls ±[{FG_WALL_HALF_MIN},{FG_WALL_HALF_MAX}] m")
+    print(f"BG grid: {n_a_bg} angles × {n_r_bg} radii = {n_a_bg*n_r_bg} env positions  "
+          f"in room walls ±[{BG_WALL_HALF_MIN},{BG_WALL_HALF_MAX}] m")
+    print(f"mics: {args.n_mics} circular @ radius ∈ {MIC_RADIUS_RANGE} m  "
+          f"RIR len: {rir_len} samples ({args.rir_seconds}s)")
+    print(f"~{bytes_per_scene/1e6:.1f} MB per scene -> "
+          f"~{bytes_per_scene*args.n_scenes/1e9:.2f} GB total")
 
     bank = []
     for _ in tqdm(range(args.n_scenes), desc="scenes"):
-        room_dim, e_abs, max_order, rt60 = sample_room(args.rt60_range)
-        mic_positions, array_center = place_array(room_dim, args.n_mics,
-                                                  args.mic_spacing, args.mic_height)
+        mic_radius = random.uniform(*MIC_RADIUS_RANGE)
+        mic_positions = place_circular_array(args.n_mics, mic_radius)
 
-        # Per-grid-point source position: polar -> clamped xyz (z-jitter per grid point)
-        source_xyz = torch.zeros(n_a, n_d, 3)
-        for ai in range(n_a):
-            for di in range(n_d):
-                source_xyz[ai, di] = torch.tensor(
-                    place_source(array_center, float(angles[ai]),
-                                 float(distances[di]), room_dim)
-                )
+        # ---- FG room: target at origin + babble grid ----
+        fg_corners, fg_absorption = sample_room(FG_WALL_HALF_MIN, FG_WALL_HALF_MAX)
+        fg_xy = [(0.0, 0.0)] + _polar_grid(babble_angles, babble_radii)
+        fg_rirs = render_grid_rirs(fg_corners, fg_absorption, mic_positions, fg_xy, rir_len)
+        target_rir  = fg_rirs[0]                                          # (M, rir_len)
+        babble_rirs = fg_rirs[1:].reshape(n_a, n_r, args.n_mics, rir_len)
 
-        rirs = render_scene_rirs(
-            room_dim, e_abs, max_order, mic_positions,
-            source_xyz.reshape(-1, 3), rir_len
-        ).reshape(n_a, n_d, args.n_mics, rir_len)
+        # ---- BG room: env grid ----
+        bg_corners, bg_absorption = sample_room(BG_WALL_HALF_MIN, BG_WALL_HALF_MAX, BG_ABSORPTION_RANGE)
+        bg_xy = _polar_grid(bg_angles, bg_radii)
+        bg_rirs = render_grid_rirs(bg_corners, bg_absorption, mic_positions,
+                                   bg_xy, rir_len).reshape(n_a_bg, n_r_bg, args.n_mics, rir_len)
 
         bank.append({
-            "room_dim":      room_dim,
-            "rt60":          rt60,
-            "array_center":  list(array_center),
-            "mic_positions": torch.from_numpy(mic_positions).float(),
-            "angles":        angles.clone(),
-            "distances":     distances.clone(),
-            "source_xyz":    source_xyz,
-            "rirs":          rirs,
+            "fg_corners":     torch.from_numpy(fg_corners).float(),
+            "fg_absorption":  fg_absorption,
+            "bg_corners":     torch.from_numpy(bg_corners).float(),
+            "bg_absorption":  bg_absorption,
+            "mic_radius":     mic_radius,
+            "mic_positions":  torch.from_numpy(mic_positions).float(),
+            "target_rir":     target_rir,
+            "babble_angles":  babble_angles.clone(),
+            "babble_radii":   babble_radii.clone(),
+            "babble_rirs":    babble_rirs,
+            "bg_angles":      bg_angles.clone(),
+            "bg_radii":       bg_radii.clone(),
+            "bg_rirs":        bg_rirs,
         })
 
     args.out_pt.parent.mkdir(parents=True, exist_ok=True)
@@ -102,14 +147,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--n-scenes", type=int, default=20)
     p.add_argument("--out-pt", type=Path, default=Path("datasets/rir_bank_beam.pt"))
-    p.add_argument("--n-mics", type=int, default=2)
-    p.add_argument("--mic-spacing", type=float, default=0.14)
-    p.add_argument("--mic-height", type=float, default=1.5)
-    p.add_argument("--rt60-range", type=float, nargs=2, default=[0.2, 0.6])
-    p.add_argument("--angle-start", type=float, default=30.0)
-    p.add_argument("--angle-stop",  type=float, default=150.0)
-    p.add_argument("--angle-step",  type=float, default=5.0)
-    p.add_argument("--distances",   type=float, nargs="+", default=[1.0, 1.5, 2.0, 2.5, 3.5])
-    p.add_argument("--rir-seconds", type=float, default=1.0)
+    p.add_argument("--n-mics", type=int, default=N_MICS_DEFAULT)
+    p.add_argument("--n-fg-angles", type=int, default=16)
+    p.add_argument("--n-fg-radii",  type=int, default=5)
+    p.add_argument("--n-bg-angles", type=int, default=8)
+    p.add_argument("--n-bg-radii",  type=int, default=3)
+    p.add_argument("--rir-seconds", type=float, default=1.5)
     p.add_argument("--seed", type=int, default=0)
     main(p.parse_args())
