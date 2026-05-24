@@ -1,4 +1,4 @@
-"""Pre-render a multi-mic RIR bank for the ClearBuds-style beam + post-filter pipeline.
+"""Pre-render a multi-mic RIR bank for the beam + post-filter training pipeline.
 
 Each scene contains two paired rooms — same circular mic array (centered at origin),
 different acoustics — matching preview.py's per-scene rendering exactly:

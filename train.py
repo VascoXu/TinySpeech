@@ -1,10 +1,10 @@
 """Train TinySpeech: causal Conv-TasNet post-filter on top of MVDR-beamformed audio.
 
-Loss follows the ClearBuds recipe (5·L1 + 0.1·SC + 0.1·log-mag, multi-res STFT) but on a
-single output stream — we predict the target voice only. See the conversation history /
-README for why C=1 here (target-only) rather than ClearBuds' C=2 (multi-mic target).
+Loss is 5·L1 + 0.1·SC + 0.1·log-mag (multi-resolution STFT). The model emits a single
+output stream (C=1) supervised against the target voice — the upstream beamformer
+already routes sources, so an auxiliary noise stream isn't useful here.
 
-Inputs are *beamformed* single-channel signals from SpatialAudioDataset; targets are the
+Inputs are beamformed single-channel signals from SpatialAudioDataset; targets are the
 (reverberant or anechoic) target voice.
 """
 import argparse
@@ -22,11 +22,11 @@ from model import TasNet
 
 GRAD_CLIP = 5.0      # max grad L2 norm
 LR_DECAY = 0.95      # exponential per-epoch LR decay
-W_L1 = 5.0           # ClearBuds: solver.py:205
+W_L1 = 5.0           # weight on waveform L1; STFT terms are ~10x lighter (see losses.py)
 
 
 def compute_loss(estimate, target, stft_loss):
-    """ClearBuds-style loss recipe on a single output stream."""
+    """W_L1 · waveform-L1 + multi-resolution STFT (spectral conv + log-mag L1)."""
     # estimate: (B, 1, T)   target: (B, T)
     return W_L1 * F.l1_loss(estimate[:, 0], target) + stft_loss(estimate[:, 0], target)
 

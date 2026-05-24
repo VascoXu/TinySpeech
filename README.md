@@ -14,8 +14,8 @@ Library modules (importable, no `__main__`):
 |---|---|
 | [`dataset.py`](dataset.py) | `SpatialAudioDataset` (live training mixtures), `ProcessedSpeechDataset` (frozen val/test), `DATASETS`, audio helpers |
 | [`beamforming.py`](beamforming.py) | Room sampling, mic-array placement, RIR rendering, MVDR weights + beamforming, peak normalize, `fft_convolve` |
-| [`model.py`](model.py) | `TasNet` — causal Conv-TasNet, ClearBuds-shape defaults |
-| [`losses.py`](losses.py) | `MultiResSTFTLoss` — ClearBuds 3-resolution recipe |
+| [`model.py`](model.py) | `TasNet` — causal Conv-TasNet (N=256, L=40, B=256, H=512, X=8, R=4, C=1) |
+| [`losses.py`](losses.py) | `MultiResSTFTLoss` — spectral convergence + log-mag at 3 resolutions |
 | [`metrics.py`](metrics.py) | `calc_sdr_torch` (SI-SDR) |
 
 Scripts (one entry point each):
@@ -32,7 +32,7 @@ Scripts (one entry point each):
 
 ## Train
 
-Training input is MVDR-beamformed mono audio: live multi-mic ClearBuds-style scenes (2D polygon rooms, 4-mic circular array at the origin, target at origin, K~U[1,3] babble + 1 env source) → MVDR with all-ones steering + oracle noise covariance → mono. Loss is ClearBuds' 5·L1 + 0.1·SC + 0.1·log-mag multi-resolution STFT.
+Training input is MVDR-beamformed mono audio. Each example is a live multi-mic scene (2D polygon room, 4-mic circular array at the origin, target voice at origin, K~U[1,3] babble talkers + 1 env source in a separate larger room) → MVDR with all-ones steering + oracle noise covariance → mono. Loss is 5·L1 + 0.1·SC + 0.1·log-mag (waveform L1 plus multi-resolution STFT).
 
 ```bash
 # 1. Render the multi-mic RIR bank (one-time)

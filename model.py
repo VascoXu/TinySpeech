@@ -1,13 +1,13 @@
 """Causal Conv-TasNet — single-channel post-filter for the MVDR-beamformed front end.
 
-Mirrors the ClearBuds reference (clearbuds_waveform/src/conv_tasnet.py) exactly:
-  encoder    : strided 1D-conv with stride=L (no overlap), ReLU.   (B, 1, T) -> (B, N, K)
+  encoder    : strided 1D conv with stride=L (non-overlapping), ReLU.  (B, 1, T) -> (B, N, K)
   separator  : channelwise LayerNorm + 1×1 bottleneck + stacked dilated TCN blocks
-               + 1×1 mask projection + ReLU mask nonlinearity.     (B, N, K) -> (B, C, N, K)
-  decoder    : per-frame linear basis (N -> L), then concatenate.  (B, N, K), mask -> (B, C, K·L)
+               + 1×1 mask projection + ReLU mask nonlinearity.         (B, N, K) -> (B, C, N, K)
+  decoder    : per-frame linear basis (N -> L), then concatenate.      (B, N, K), mask -> (B, C, K·L)
 
-The model emits C streams (default C=1: just the target voice). C=2 is supported but rarely
-useful for our beamformed-input setup — see the README and conversation history for rationale.
+C is the number of output streams; default C=1 emits just the target voice. The dilated
+TCN gives the receptive field — for the default config (X=8, R=4) that's ~2k frames of
+past context, which at L=40 samples per frame works out to ~5 s at 16 kHz.
 """
 import torch
 import torch.nn as nn
@@ -124,7 +124,7 @@ class Decoder(nn.Module):
 
 
 class TasNet(nn.Module):
-    """Causal Conv-TasNet, ClearBuds-shape defaults (N=256, L=40, B=256, H=512, P=3, X=8, R=4); C=1 by default."""
+    """Causal Conv-TasNet. Defaults: N=256, L=40, B=256, H=512, P=3, X=8, R=4, C=1."""
 
     def __init__(self, N: int = 256, L: int = 40, B: int = 256, H: int = 512,
                  P: int = 3, X: int = 8, R: int = 4, C: int = 1, causal: bool = True,
@@ -134,7 +134,7 @@ class TasNet(nn.Module):
         self.P, self.X, self.R, self.C = P, X, R, C
         self.causal = causal
         self.sr = sr
-        self.stride = L  # exposed for train.py diagnostics; ClearBuds uses non-overlapping windows
+        self.stride = L  # non-overlapping encoder windows; exposed for train.py diagnostics
 
         self.encoder = Encoder(L, N)
         self.separator = TemporalConvNet(N, B, H, P, X, R, C, causal=causal)

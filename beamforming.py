@@ -1,6 +1,6 @@
-"""Room simulation + MVDR beamforming utilities (ClearBuds-style).
+"""Room simulation + MVDR beamforming utilities.
 
-Geometry (matches ClearBuds clearbuds_waveform/generate_dataset.py):
+Geometry:
   - 2D polygon rooms for both foreground (target + babble) and background (env noise)
   - 4-mic circular array centered at the origin
   - Target voice always at (0, 0); babble + env at random (angle, radius)
@@ -17,13 +17,13 @@ import torch
 
 from dataset import SR
 
-# ---- Room geometry (ClearBuds-style 2D polygon) ----
+# ---- Room geometry ----
 FG_WALL_HALF_MIN = 15.0           # FG room walls in ±[15, 20] m
 FG_WALL_HALF_MAX = 20.0
 BG_WALL_HALF_MIN = 20.0           # BG room walls in ±[20, 40] m  (separate larger room)
 BG_WALL_HALF_MAX = 40.0
 FG_ABSORPTION_RANGE = (0.1, 0.99)
-BG_ABSORPTION_RANGE = (0.5, 0.99) # more absorptive → diffuse-sounding distant noise (ClearBuds)
+BG_ABSORPTION_RANGE = (0.5, 0.99) # higher absorption → diffuse-sounding distant noise
 MAX_ORDER = 10
 
 # ---- Mic array ----
@@ -36,7 +36,7 @@ BABBLE_K_RANGE = (1, 3)           # random number of babble talkers per example
 BABBLE_RADIUS_RANGE = (1.0, 5.0)
 BG_RADIUS_RANGE = (10.0, 20.0)
 
-# ---- Volumes (peak normalization, ClearBuds-style) ----
+# ---- Volumes (peak normalization) ----
 FG_VOL_RANGE = (0.15, 0.4)
 BG_VOL_RANGE = (0.2, 0.5)
 

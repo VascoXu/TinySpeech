@@ -1,13 +1,14 @@
-"""Multi-resolution STFT loss — ClearBuds recipe.
+"""Multi-resolution STFT loss: spectral convergence + log-magnitude L1 across 3 STFT sizes.
 
-Reference: clearbuds_waveform/src/stft_loss.py + solver.py:205 ::
-    loss = 5 * F.l1_loss(gt, estimate) + 0.2 * sc + 0.2 * mag
-where (sc, mag) come from MultiResolutionSTFTLoss(factor_sc=0.5, factor_mag=0.5), i.e.
-they already include a 0.5 prefactor. Effective combined weights are 5·L1 + 0.1·SC + 0.1·log-mag.
+Returns a single scalar = W_SC · mean(SC across resolutions) + W_MAG · mean(log-mag L1).
+Used together with a waveform L1 term computed in train.py; the combined training recipe
+is 5·L1 + 0.1·SC + 0.1·log-mag.
 
-L1 is computed externally in train.py so it can be applied across both output streams (target +
-noise), matching ClearBuds' multi-mic L1 broadcast at solver.py:201. The multi-res STFT loss
-is applied to the target stream only (matching solver.py:203).
+  - Spectral convergence (SC): ||S_target − S_est||_F / ||S_target||_F. Penalizes the
+    structural error in magnitude; robust to overall level mismatch.
+  - Log-mag L1: mean |log|S_target| − log|S_est||. Focuses on perceptual loudness scale.
+
+Both terms reduce globally (one scalar across batch × freq × time), not per-sample.
 """
 import torch
 import torch.nn as nn
@@ -18,8 +19,8 @@ FFT_SIZES = (1024, 2048, 512)
 HOP_SIZES = (120, 240, 50)
 WIN_SIZES = (600, 1200, 240)
 
-W_SC = 0.1   # 0.2 outer × 0.5 inner (factor_sc) in ClearBuds
-W_MAG = 0.1  # 0.2 outer × 0.5 inner (factor_mag) in ClearBuds
+W_SC = 0.1   # weight on spectral-convergence loss
+W_MAG = 0.1  # weight on log-magnitude L1 loss
 
 
 class _STFTLoss(nn.Module):
@@ -43,14 +44,14 @@ class _STFTLoss(nn.Module):
     def forward(self, estimate: torch.Tensor, target: torch.Tensor):
         est_mag = self._mag(estimate)
         ref_mag = self._mag(target)
-        # ClearBuds: global Frobenius ratio (one scalar over batch + freq + time)
+        # Global Frobenius ratio: one scalar over batch + freq + time (not per-sample).
         sc = torch.norm(ref_mag - est_mag, p="fro") / (torch.norm(ref_mag, p="fro") + 1e-8)
         mag = F.l1_loss(torch.log(est_mag), torch.log(ref_mag))
         return sc, mag
 
 
 class MultiResSTFTLoss(nn.Module):
-    """Sum of single-resolution STFT losses, scaled by ClearBuds weights (W_SC, W_MAG)."""
+    """Sum of single-resolution STFT losses, scaled by W_SC and W_MAG."""
 
     def __init__(self,
                  fft_sizes=FFT_SIZES, hop_sizes=HOP_SIZES, win_sizes=WIN_SIZES,

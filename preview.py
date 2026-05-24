@@ -1,4 +1,4 @@
-"""Render and save a few ClearBuds-style multi-mic scenes for listening.
+"""Render and save a few multi-mic scenes for listening.
 
 Per example: a random 2D polygon FG room with 4 mics at the origin, target voice at the
 origin, K~U[1,3] babble talkers in the FG room, and one env-noise source in a separate
