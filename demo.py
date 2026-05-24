@@ -1,10 +1,4 @@
-"""Run a trained post-filter checkpoint on a .wav and save the denoised output.
-
-Multi-channel input gets a simple delay-and-sum beamformer (channel mean) applied before
-the post-filter, which roughly matches the training distribution of beamformed mono inputs
-for a target near boresight (i.e., the wearer is looking at the talker). Production would
-use MVDR with gaze-direction steering — that's not done here to keep the demo dependency-light.
-"""
+"""Run a trained post-filter checkpoint on a .wav and save the denoised output."""
 import argparse
 import time
 from pathlib import Path
@@ -22,19 +16,12 @@ def save_wav(path: Path, x: torch.Tensor, norm: float) -> None:
 
 
 def main(args):
-    # CPU-only: AR-glasses target is on-device CPU, GPU numbers are not representative.
     device = torch.device("cpu")
 
     samples = AudioDecoder(str(args.input), sample_rate=SR).get_all_samples().data  # (C, T)
     n_channels = samples.shape[0]
     duration = samples.shape[1] / SR
-    if n_channels == 1:
-        noisy = samples[0]
-        print(f"input: 1 channel, {duration:.1f}s — passing through directly")
-        print("  (note: model was trained on beamformed multi-mic input; mono will be sub-optimal)")
-    else:
-        noisy = samples.mean(dim=0)
-        print(f"input: {n_channels} channels, {duration:.1f}s — delay-and-sum (channel mean) -> mono")
+    noisy = samples[0] if n_channels == 1 else samples.mean(dim=0)
 
     model = TasNet(causal=True, sr=SR).to(device).eval()
     ckpt = torch.load(args.checkpoint, map_location=device)

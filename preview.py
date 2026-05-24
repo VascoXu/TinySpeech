@@ -4,7 +4,7 @@ Per example: a random 2D polygon FG room with 4 mics at the origin, target voice
 origin, K~U[1,3] babble talkers in the FG room, and one env-noise source in a separate
 larger BG room. MVDR-beamforms with all-ones steering (target at array center) + oracle
 noise covariance, then saves the raw mic, the beamformed mix, and the per-component
-beamformed signals so you can hear what each stage contributes.
+beamformed signals.
 """
 import argparse
 import random

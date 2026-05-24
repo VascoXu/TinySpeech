@@ -1,9 +1,6 @@
 """Datasets and speech-loading helpers for the beamforming + post-filter pipeline.
 
-`SpatialAudioDataset` produces (beamformed, target) pairs by drawing a random pre-rendered
-scene from a RIR bank (see render_bank.py), convolving fresh audio at runtime, and
-MVDR-beamforming. `ProcessedSpeechDataset` is the matching reader for pre-rendered fixed
-val/test sets (see render_val.py).
+`SpatialAudioDataset` produces (beamformed, target) pairs
 """
 import random
 from pathlib import Path
@@ -14,8 +11,6 @@ from torchcodec.decoders import AudioDecoder
 
 SR = 16000
 
-# Dataset registry — short name -> speech root. Lets train.py take --dataset vctk librispeech
-# instead of typing out full paths every invocation.
 DATASETS = {
     "vctk":        Path("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed"),
     "librispeech": Path("datasets/LibriSpeech/train-clean-360"),
@@ -50,7 +45,7 @@ def list_speech_files(roots) -> list:
 
 def _convolve_to_mics(audio: torch.Tensor, per_mic_rirs: torch.Tensor, n_samples: int) -> torch.Tensor:
     """audio: (T,)  +  per_mic_rirs: (M, rir_len)  ->  (M, n_samples)."""
-    from beamforming import fft_convolve  # local import: keeps dataset module importable from beamforming
+    from beamforming import fft_convolve
     return torch.stack([
         fft_convolve(audio, per_mic_rirs[m], n_samples)
         for m in range(per_mic_rirs.size(0))
@@ -119,7 +114,7 @@ class SpatialAudioDataset(Dataset):
         target_mic = _convolve_to_mics(target_audio, scene["target_rir"], n)
         target_mic = peak_normalize(target_mic, random.uniform(*self._fg_vol_range))
 
-        # Silence-target augmentation
+        # With some probability, have no target voice
         if random.random() < self.silence_prob:
             target_audio = torch.zeros_like(target_audio)
             target_mic = torch.zeros_like(target_mic)
