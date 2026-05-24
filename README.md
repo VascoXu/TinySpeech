@@ -28,6 +28,7 @@ Scripts (one entry point each):
 | [`train.py`](train.py) | Training loop |
 | [`eval.py`](eval.py) | Eval on a frozen test set: SI-SDR, SI-SDRi, PESQ, STOI |
 | [`demo.py`](demo.py) | Run a checkpoint on a real `.wav` |
+| [`cascade.py`](cascade.py) | Conv-TasNet → ClearBuds-UNet TF-mask cascade on a real `.wav` |
 | [`spectrogram.py`](spectrogram.py) | Side-by-side log-mag spectrograms of (noisy, target, estimate) |
 
 ## Train
@@ -94,3 +95,13 @@ python demo.py --input some.wav --out-dir out/ --checkpoint checkpoints/best.pt
 ```
 
 Multi-channel input is averaged (delay-and-sum at boresight); for true MVDR on a real recording you'd need known mic positions and an oracle/estimate of the noise covariance — out of scope for the demo.
+
+## Cascade (Conv-TasNet → UNet TF-mask)
+
+Reference baseline: feed the Conv-TasNet output through ClearBuds' pretrained spectrogram UNet, which predicts a TF-bin "voice vs artifact" mask. Bins flagged as artifact are zeroed in the linear STFT before ISTFT. Substantially reduces Conv-TasNet's residual smearing and musical-noise artifacts.
+
+```bash
+python cascade.py --input some.wav --out-dir out/
+```
+
+Writes both `baseline.wav` (Conv-TasNet only) and `cascade.wav` (+ UNet gate) for A/B. Tunable `--cutoff` controls how aggressive the gate is (default 0.003; lower = gentler, higher = cleaner silence but risks chopping consonants). Requires the ClearBuds reference checkout at `clearbuds/clearbuds_spectrogram/` for the UNet checkpoint.
