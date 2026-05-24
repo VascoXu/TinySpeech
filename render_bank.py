@@ -1,7 +1,7 @@
 """Pre-render a multi-mic RIR bank for the ClearBuds-style beam + post-filter pipeline.
 
 Each scene contains two paired rooms — same circular mic array (centered at origin),
-different acoustics — to match beam.py exactly:
+different acoustics — matching preview.py's per-scene rendering exactly:
 
   - FG (foreground) room: 2D polygon, walls in ±[15, 20] m. Holds the target RIR
     (one position at origin) and a grid of babble RIRs at (angle, radius).
@@ -36,7 +36,7 @@ import pyroomacoustics as pra
 import torch
 from tqdm import tqdm
 
-from beam import (
+from beamforming import (
     BABBLE_RADIUS_RANGE, BG_ABSORPTION_RANGE, BG_RADIUS_RANGE,
     BG_WALL_HALF_MAX, BG_WALL_HALF_MIN,
     FG_WALL_HALF_MAX, FG_WALL_HALF_MIN,

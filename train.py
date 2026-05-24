@@ -176,7 +176,7 @@ if __name__ == "__main__":
     p.add_argument("--sample-rate", type=int, default=16000)
     p.add_argument("--segment-seconds", type=float, default=3.0)
     p.add_argument("--beam-bank", type=Path, required=True,
-                   help="Multi-mic RIR bank .pt rendered by beam_bank.py")
+                   help="Multi-mic RIR bank .pt rendered by render_bank.py")
     p.add_argument("--target-type", choices=["anechoic", "reverberant"], default="reverberant",
                    help="reverberant = target-only path through MVDR (denoise-only task, "
                         "exact noise = noisy - target via linearity of MVDR); "

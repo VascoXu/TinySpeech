@@ -46,4 +46,5 @@ venv.bak/
 **/datasets
 **/clearbuds
 **/real_outputs
-**/dataout/
+**/data/
+**/out/

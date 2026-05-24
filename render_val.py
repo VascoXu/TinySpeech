@@ -1,9 +1,7 @@
-"""Pack a fixed (beamformed, sources) tensor file from SpatialAudioDataset for reproducible eval.
+"""Pack a fixed (beamformed, target) .pt file from SpatialAudioDataset for reproducible eval.
 
-Matches the format produced by prepare.py (a {noisy, sources} dict loadable by
-ProcessedSpeechDataset), so it drops into the same train.py / eval.py paths without
-any consumer changes — the only difference is that `noisy` here is a beamformed
-single-channel signal instead of a raw single-mic mixture.
+Drops into train.py / eval.py via ProcessedSpeechDataset. Each example is a single
+random draw from the live training distribution, frozen for repeatable val/test scores.
 """
 import argparse
 import random
@@ -50,7 +48,7 @@ if __name__ == "__main__":
                    help=f"Speech dataset(s) for target+babble. Choices: {sorted(DATASETS.keys())}")
     p.add_argument("--wham-root", type=Path, required=True)
     p.add_argument("--beam-bank", type=Path, required=True,
-                   help="Multi-mic RIR bank .pt rendered by beam_bank.py")
+                   help="Multi-mic RIR bank .pt rendered by render_bank.py")
     p.add_argument("--out-pt", type=Path, default=Path("datasets/val_beam.pt"))
     p.add_argument("--n-examples", type=int, default=200)
     p.add_argument("--segment-seconds", type=float, default=3.0)

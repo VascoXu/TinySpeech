@@ -72,7 +72,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--test-pt", type=Path, required=True,
-                   help="Pre-rendered (noisy, target) test set — see beam_prepare.py / prepare.py")
+                   help="Pre-rendered (noisy, target) test set — see render_val.py")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda:0")
